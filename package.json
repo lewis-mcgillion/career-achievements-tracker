@@ -1,0 +1,19 @@
+{
+  "name": "career-tracker",
+  "version": "1.0.0",
+  "description": "Automated career achievements tracker powered by GitHub Actions and Copilot",
+  "type": "module",
+  "scripts": {
+    "fetch": "tsx scripts/fetch-activity.ts",
+    "bootstrap": "tsx scripts/bootstrap.ts"
+  },
+  "dependencies": {
+    "octokit": "^4.1.0",
+    "date-fns": "^4.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.0.0"
+  }
+}

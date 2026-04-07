@@ -1,0 +1,19 @@
+node_modules/
+dist/
+fetched-data/
+*.tsbuildinfo
+
+# Sensitive data patterns
+.env
+.env.*
+*.pem
+*.key
+*.token
+.secrets
+career-data/
+
+# OS and editor files
+.DS_Store
+*.swp
+*.swo
+*~
