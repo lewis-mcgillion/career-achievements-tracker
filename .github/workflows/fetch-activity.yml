@@ -68,7 +68,7 @@ jobs:
             --start-date "${{ steps.dates.outputs.start_date }}" \
             --end-date "${{ steps.dates.outputs.end_date }}" \
             --username "${{ github.repository_owner }}" \
-            --output-dir "./fetched-data" 2>&1 | head -2000
+            --output-dir "./fetched-data"
 
       - name: Push data to private career-data repo
         env:
@@ -76,10 +76,11 @@ jobs:
         run: |
           # Clone using credential helper to avoid PAT in URLs/logs
           git -c "credential.helper=!f(){ echo username=x-access-token; echo password=${PAT}; };f" \
-            clone https://github.com/${{ github.repository_owner }}/career-data.git /tmp/career-data 2>/dev/null
+            clone https://github.com/${{ github.repository_owner }}/career-data.git /tmp/career-data
           cp -r ./fetched-data/* /tmp/career-data/data/ 2>/dev/null || true
           cd /tmp/career-data
-          git config user.name "github-actions[bot]"
+          git -c "credential.helper=!f(){ echo username=x-access-token; echo password=${PAT}; };f" \
+            config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
@@ -88,7 +89,8 @@ jobs:
             git commit -q -m "data: activity fetch
 
           Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
-            git push -q 2>/dev/null
+            git -c "credential.helper=!f(){ echo username=x-access-token; echo password=${PAT}; };f" \
+              push -q
             echo "✅ Data pushed"
           fi
 
