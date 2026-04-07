@@ -2,6 +2,45 @@ import { execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 
 // ---------------------------------------------------------------------------
+// Validation constants (exported for testing)
+// ---------------------------------------------------------------------------
+export const USERNAME_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/;
+export const REPO_RE = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
+
+// ---------------------------------------------------------------------------
+// Validation helpers (exported for testing)
+// ---------------------------------------------------------------------------
+export function validateUsername(username: string): boolean {
+  return USERNAME_RE.test(username);
+}
+
+export function validateRepo(repo: string): boolean {
+  return REPO_RE.test(repo);
+}
+
+export function parseRepoList(input: string): string[] {
+  return input.split(",").map((r) => r.trim()).filter(Boolean);
+}
+
+export function validateRepoList(repos: string[]): { valid: boolean; invalid?: string } {
+  if (repos.length === 0) return { valid: false, invalid: "(empty)" };
+  for (const r of repos) {
+    if (!REPO_RE.test(r)) return { valid: false, invalid: r };
+  }
+  return { valid: true };
+}
+
+export function validatePat(pat: string): boolean {
+  return pat.length > 0;
+}
+
+export function checkRepoIsPrivate(ghOutput: string): { exists: boolean; isPrivate: boolean } {
+  const exists = ghOutput.includes("career-data");
+  const isPrivate = ghOutput.includes('"isPrivate":true');
+  return { exists, isPrivate };
+}
+
+// ---------------------------------------------------------------------------
 // Interactive readline helper
 // ---------------------------------------------------------------------------
 const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -34,9 +73,6 @@ function runWithEnv(cmd: string, env: Record<string, string>): string {
     return "";
   }
 }
-
-const USERNAME_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$/;
-const REPO_RE = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
 
 // ---------------------------------------------------------------------------
 // Main bootstrap flow
