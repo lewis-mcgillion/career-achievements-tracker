@@ -263,26 +263,37 @@ function sanitizeError(err: unknown, username?: string): string {
 
 /** Wraps a fetch function to catch ALL errors and sanitize them */
 async function safeFetch<T>(fn: () => Promise<T>, username?: string): Promise<T> {
-  try {
-    return await fn();
-  } catch (err: unknown) {
-    const e = err as { status?: number; response?: { headers?: Record<string, string> } };
-    // Handle rate limits with retry
-    if (e.status === 403 || e.status === 429) {
-      const resetHeader = e.response?.headers?.["x-ratelimit-reset"];
-      const resetTime = resetHeader ? parseInt(resetHeader, 10) * 1000 : Date.now() + 60_000;
-      const waitMs = Math.max(resetTime - Date.now(), 1000);
-      console.warn(`  ⏳ Rate limited, waiting...`);
-      await new Promise((r) => setTimeout(r, waitMs));
-      try {
-        return await fn();
-      } catch (retryErr: unknown) {
-        throw new Error(sanitizeError(retryErr, username));
+  const maxRetries = 3;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      const e = err as { status?: number; response?: { headers?: Record<string, string> } };
+      // Retry on server errors (5xx)
+      if (e.status && e.status >= 500 && attempt < maxRetries) {
+        const waitMs = attempt * 10_000; // 10s, 20s
+        console.warn(`  ⚠ Server error, retrying in ${waitMs / 1000}s (attempt ${attempt}/${maxRetries})...`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
       }
+      // Handle rate limits with retry
+      if (e.status === 403 || e.status === 429) {
+        const resetHeader = e.response?.headers?.["x-ratelimit-reset"];
+        const resetTime = resetHeader ? parseInt(resetHeader, 10) * 1000 : Date.now() + 60_000;
+        const waitMs = Math.max(resetTime - Date.now(), 1000);
+        console.warn(`  ⏳ Rate limited, waiting...`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        try {
+          return await fn();
+        } catch (retryErr: unknown) {
+          throw new Error(sanitizeError(retryErr, username));
+        }
+      }
+      // All other errors — sanitize and rethrow
+      throw new Error(sanitizeError(err, username));
     }
-    // All other errors — sanitize and rethrow
-    throw new Error(sanitizeError(err, username));
   }
+  throw new Error("Max retries exceeded");
 }
 
 // ---------------------------------------------------------------------------
@@ -330,47 +341,52 @@ async function main(): Promise<void> {
       const repoIndex = args.repos.indexOf(repoFull) + 1;
       console.log(`\n  📦 Repo ${repoIndex}/${args.repos.length}`);
 
-      const issuesCreated = await safeFetch(
-        () => fetchIssuesCreated(octokit, owner, repo, args.username, range.since, range.until),
-        args.username
-      );
-      allIssuesCreated.push(...issuesCreated.map((i) => ({ ...i as object, _source_repo: repoFull })));
+      try {
+        const issuesCreated = await safeFetch(
+          () => fetchIssuesCreated(octokit, owner, repo, args.username, range.since, range.until),
+          args.username
+        );
+        allIssuesCreated.push(...issuesCreated.map((i) => ({ ...i as object, _source_repo: repoFull })));
 
-      const issuesAssigned = await safeFetch(
-        () => fetchIssuesAssigned(octokit, owner, repo, args.username, range.since, range.until),
-        args.username
-      );
-      allIssuesAssigned.push(...issuesAssigned.map((i) => ({ ...i as object, _source_repo: repoFull })));
+        const issuesAssigned = await safeFetch(
+          () => fetchIssuesAssigned(octokit, owner, repo, args.username, range.since, range.until),
+          args.username
+        );
+        allIssuesAssigned.push(...issuesAssigned.map((i) => ({ ...i as object, _source_repo: repoFull })));
 
-      const prsCreated = await safeFetch(
-        () => fetchPRsCreated(octokit, owner, repo, args.username, range.since, range.until),
-        args.username
-      );
-      allPRsCreated.push(...prsCreated.map((i) => ({ ...i as object, _source_repo: repoFull })));
+        const prsCreated = await safeFetch(
+          () => fetchPRsCreated(octokit, owner, repo, args.username, range.since, range.until),
+          args.username
+        );
+        allPRsCreated.push(...prsCreated.map((i) => ({ ...i as object, _source_repo: repoFull })));
 
-      const prsAssigned = await safeFetch(
-        () => fetchPRsAssigned(octokit, owner, repo, args.username, range.since, range.until),
-        args.username
-      );
-      allPRsAssigned.push(...prsAssigned.map((i) => ({ ...i as object, _source_repo: repoFull })));
+        const prsAssigned = await safeFetch(
+          () => fetchPRsAssigned(octokit, owner, repo, args.username, range.since, range.until),
+          args.username
+        );
+        allPRsAssigned.push(...prsAssigned.map((i) => ({ ...i as object, _source_repo: repoFull })));
 
-      const prReviews = await safeFetch(
-        () => fetchPRReviews(octokit, owner, repo, args.username, range.since, range.until),
-        args.username
-      );
-      allPRReviews.push(...prReviews.map((i) => ({ ...i as object, _source_repo: repoFull })));
+        const prReviews = await safeFetch(
+          () => fetchPRReviews(octokit, owner, repo, args.username, range.since, range.until),
+          args.username
+        );
+        allPRReviews.push(...prReviews.map((i) => ({ ...i as object, _source_repo: repoFull })));
 
-      const issueComments = await safeFetch(
-        () => fetchIssueComments(octokit, owner, repo, args.username, range.since, range.until),
-        args.username
-      );
-      allIssueComments.push(...issueComments.map((i) => ({ ...i as object, _source_repo: repoFull })));
+        const issueComments = await safeFetch(
+          () => fetchIssueComments(octokit, owner, repo, args.username, range.since, range.until),
+          args.username
+        );
+        allIssueComments.push(...issueComments.map((i) => ({ ...i as object, _source_repo: repoFull })));
 
-      const prComments = await safeFetch(
-        () => fetchPRComments(octokit, owner, repo, args.username, range.since, range.until),
-        args.username
-      );
-      allPRComments.push(...prComments.map((i) => ({ ...i as object, _source_repo: repoFull })));
+        const prComments = await safeFetch(
+          () => fetchPRComments(octokit, owner, repo, args.username, range.since, range.until),
+          args.username
+        );
+        allPRComments.push(...prComments.map((i) => ({ ...i as object, _source_repo: repoFull })));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "unknown error";
+        console.warn(`  ⚠ Skipping repo ${repoIndex} due to error: ${msg}`);
+      }
     }
 
     // Write all data files for this month
