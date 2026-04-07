@@ -174,28 +174,28 @@ async function searchItems(
 async function fetchIssuesCreated(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
-  const q = `repo:${owner}/${repo} is:issue author:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
+  const q = `repo:${owner}/${repo} is:issue is:closed reason:completed author:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
   return searchItems(octokit, q, "issues-created");
 }
 
 async function fetchIssuesAssigned(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
-  const q = `repo:${owner}/${repo} is:issue assignee:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
+  const q = `repo:${owner}/${repo} is:issue is:closed reason:completed assignee:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
   return searchItems(octokit, q, "issues-assigned");
 }
 
 async function fetchPRsCreated(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
-  const q = `repo:${owner}/${repo} is:pr author:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
+  const q = `repo:${owner}/${repo} is:pr is:merged author:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
   return searchItems(octokit, q, "prs-created");
 }
 
 async function fetchPRsAssigned(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
-  const q = `repo:${owner}/${repo} is:pr assignee:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
+  const q = `repo:${owner}/${repo} is:pr is:merged assignee:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
   return searchItems(octokit, q, "prs-assigned");
 }
 
