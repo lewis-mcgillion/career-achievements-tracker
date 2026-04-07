@@ -108,11 +108,175 @@ async function loadJson<T>(path: string): Promise<T[]> {
 }
 
 // ---------------------------------------------------------------------------
+// Description extraction — pull impact from PR/issue bodies
+// ---------------------------------------------------------------------------
+
+// Patterns to strip from bodies (boilerplate, template noise, links)
+const BODY_NOISE_PATTERNS = [
+  /closes?\s+https?:\/\/[^\s)]+/gi,
+  /related?\s+https?:\/\/[^\s)]+/gi,
+  /part\s+of\s+https?:\/\/[^\s)]+/gi,
+  /fixes?\s+https?:\/\/[^\s)]+/gi,
+  /https?:\/\/[^\s)>]+/gi,
+  /<!--[\s\S]*?-->/g,
+  /<img[^>]*\/?>/gi,
+  /<details[\s\S]*?<\/details>/gi,     // collapsed sections
+  /!\[[^\]]*\]\([^)]*\)/g,            // markdown images
+  /\[[^\]]*\]\(\)/g,                  // empty markdown links [text]()
+  /\[[^\]]*\]\(https?:\/\/[^)]*\)/g,  // markdown links with URLs
+  /^#+\s*(what approach|which feature flag|which environment|screenshot|test plan|rollout|rollback|how to test|how did you test|deploy notes|risk|additional context|checklist|corresponding work|description of change|tracking issue|link to any feature flag|type of change|motivation|context|pre[- ]?merge|post[- ]?merge|merge requirements|deploy).*$/gim,
+  /^>\s*(if you are adding|note:|warning:|important:)/gim,  // template callouts
+  /^-\s*\[[ x]\]\s*.*/gim,           // checklist items
+  /^\s*-\s*Production:.*$/gim,        // deployment targets
+  /^\s*-\s*Staging:.*$/gim,
+  /^\s*<!--.*-->.*$/gm,
+  /\*\*(low|medium|high)\s*risk:?\*\*[^.\n]*\.?/gi,
+  /- Changes are fully under feature flag.*$/gim,
+  /- This change will be tested.*$/gim,
+  /- I ran `?UI=1.*$/gim,
+  /\*\*[A-Z][a-z]+:\*\*/g,
+  /`environment:[^`]+`/g,
+  /`[^`]*feature[_-]flag[^`]*`/g,
+  /\(#\d+\)/g,
+  /#\d{3,}/g,
+  /\b(cc|ping|fyi)\b\s*@\w+/gi,
+  /@[a-zA-Z0-9_-]+/g,
+  /\bPlease remember to add.*$/gim,    // issue template reminder
+  /\b(Triaged by|reported by):?\s*/gi,
+  /\bvia\s*\.\s*/gi,
+  /\bShortly,\s+will provide.*$/gim,
+  /\bBelow is the.*$/gim,
+  /If you are adding a feature flag.*$/gim,
+  /the owning service be\b.*$/gim,
+  /otherwise\s+\w+\s+will not be able to capture.*$/gim,
+  /a feature flag to CAPI.*$/gim,
+  /configured within the list of services.*$/gim,
+];
+
+// Internal identifiers to redact
+const REDACT_PATTERNS = [
+  /\b[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+\b/g, // org/repo
+  /\b(copilot[_-]\w+)\b/gi,                 // feature flag names (keep if generic)
+  /\b(devportal|githubapp|dotcom)\b/gi,
+];
+
+function extractDescription(body: string | undefined, maxLen = 200): string {
+  if (!body || body.length < 10) return "";
+
+  let text = body;
+
+  // Remove noise
+  for (const pat of BODY_NOISE_PATTERNS) {
+    text = text.replace(pat, "");
+  }
+
+  // Split into lines, filter meaningful ones
+  const lines = text.split("\n")
+    .map((l) => l.trim())
+    .filter((l) =>
+      l.length > 15 &&
+      !l.startsWith("#") &&
+      !l.startsWith("|") &&
+      !l.startsWith("```") &&
+      !l.startsWith("- [ ]") &&
+      !l.startsWith("- [x]") &&
+      !l.startsWith("Co-authored") &&
+      !l.startsWith(">") &&
+      !l.match(/^[-*]\s*$/) &&
+      !l.match(/^\s*$/) &&
+      !l.match(/^_link to/i) &&
+      !l.match(/^please remember/i) &&
+      !l.match(/^\*\*screenshot/i) &&
+      !l.match(/^<details/i) &&
+      !l.match(/^<summary/i) &&
+      !l.match(/^<\/details/i) &&
+      !l.match(/^> \[!/i) &&
+      !l.match(/^(before|after)\s*[:(/]/i) &&
+      !l.match(/^looks like this/i) &&      // dangling image reference
+      !l.match(/^see (below|above|image)/i) &&
+      !l.match(/^-\s*-\s*/i) &&            // double dash lists (template noise)
+      !l.match(/^if you are adding/i) &&
+      !l.match(/^the owning service/i)
+    );
+
+  if (lines.length === 0) return "";
+
+  // Take first 1-2 meaningful lines as the description
+  let desc = lines.slice(0, 2).join(" ").trim();
+
+  // Clean up internal references
+  for (const pat of REDACT_PATTERNS) {
+    desc = desc.replace(pat, "");
+  }
+
+  // Clean up leftover artifacts
+  desc = desc
+    .replace(/<[^>]+>/g, "")           // any remaining HTML tags
+    .replace(/\*\*[^*]*\*\*/g, "")     // bold markers with content (risk labels etc)
+    .replace(/\*\*/g, "")              // orphan bold markers
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // remaining markdown links → text only
+    .replace(/\[([^\]]*)\]\(\)/g, "$1") // empty links
+    .replace(/`([^`]+)`/g, "$1")        // inline code → plain text
+    .replace(/\s*-\s*-\s*/g, ". ")      // double dash separators → period
+    .replace(/\.\s*\./g, ".")           // double periods
+    .replace(/\s{2,}/g, " ")
+    .replace(/^\s*[-–—:,.\s]+/, "")     // leading punctuation
+    .replace(/\s*[-–—]\s*$/, "")
+    .replace(/:\s*$/g, "")              // trailing colons (from stripped images)
+    .trim();
+
+  if (desc.length < 15) return "";
+
+  // Final pass: remove common PR template fragments that survive earlier cleanup
+  desc = desc
+    .replace(/\ba feature flag to \w+,?\s*the owning service be\b.*/gi, "")
+    .replace(/\bconfigured within the list of services\b.*/gi, "")
+    .replace(/\s*,\s*$/, "") // trailing comma
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  if (desc.length < 15) return "";
+  if (desc.length > maxLen) desc = desc.slice(0, maxLen).replace(/\s\S*$/, "…");
+
+  return desc;
+}
+
+// Build a rich description line: title + context from body
+function buildItemLine(item: ActivityItem): string {
+  const title = sanitize(item.title ?? "untitled");
+  const desc = extractDescription(item.body);
+
+  if (!desc) return `**${title}**`;
+  // Capitalize first letter of description
+  const descCap = desc.charAt(0).toUpperCase() + desc.slice(1);
+  return `**${title}** — ${descCap}`;
+}
+
+// Clean a comment body for display — strip noise, URLs, images, short results
+function cleanCommentBody(raw: string, maxLen = 200): string {
+  let body = raw;
+  // Remove URLs, images, HTML, markdown links
+  body = body.replace(/https?:\/\/[^\s)>]+/gi, "");
+  body = body.replace(/<img[^>]*\/?>/gi, "");
+  body = body.replace(/<[^>]+>/g, "");
+  body = body.replace(/!\[[^\]]*\]\([^)]*\)/g, "");
+  body = body.replace(/\[[^\]]*\]\([^)]*\)/g, (m) => m.replace(/\[([^\]]*)\]\([^)]*\)/, "$1"));
+  body = body.replace(/@[a-zA-Z0-9_-]+/g, "");
+  body = body.replace(/\b[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+\b/g, "");
+  body = body.replace(/#\d{3,}/g, "");
+  body = body.replace(/`([^`]+)`/g, "$1");
+  body = body.replace(/\s{2,}/g, " ").trim();
+  if (body.length > maxLen) body = body.slice(0, maxLen).replace(/\s\S*$/, "…");
+  return body;
+}
+
+// ---------------------------------------------------------------------------
 // Theme extraction — group work into meaningful categories
 // ---------------------------------------------------------------------------
 interface ThemeGroup {
   area: string;
-  items: string[];
+  items: string[];   // rich description lines (title + body context)
+  rawCount: number;   // original count before dedup
 }
 
 function extractThemes(items: ActivityItem[]): ThemeGroup[] {
@@ -120,14 +284,13 @@ function extractThemes(items: ActivityItem[]): ThemeGroup[] {
 
   for (const item of items) {
     const area = repoToArea(item._source_repo ?? "");
-    const title = item.title ?? "untitled";
     if (!byArea.has(area)) byArea.set(area, []);
-    byArea.get(area)!.push(sanitize(title));
+    byArea.get(area)!.push(buildItemLine(item));
   }
 
   return Array.from(byArea.entries())
     .sort((a, b) => b[1].length - a[1].length)
-    .map(([area, items]) => ({ area, items }));
+    .map(([area, items]) => ({ area, items, rawCount: items.length }));
 }
 
 // Deduplicate titles that are very similar (e.g., same PR in created + assigned)
@@ -181,17 +344,56 @@ function generateMonthlyMarkdown(
   if (prThemes.length === 0 && issueThemes.length === 0) {
     lines.push("_No merged PRs or completed issues this month._");
   } else {
-    // Summarize top areas of work
-    const allAreas = new Map<string, number>();
-    for (const t of [...prThemes, ...issueThemes]) {
-      allAreas.set(t.area, (allAreas.get(t.area) ?? 0) + t.items.length);
-    }
-    const topAreas = Array.from(allAreas.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 4);
+    // Detect work themes from titles to build narrative
+    const allTitles = [...allPrs, ...allIssues].map((i) => (i.title ?? "").toLowerCase());
+    const themeKeywords: Array<{ label: string; keywords: string[]; found: string[] }> = [
+      { label: "Security", keywords: ["security", "bounty", "vulnerability", "injection", "xss", "csrf", "auth", "permission", "access control"], found: [] },
+      { label: "Performance & reliability", keywords: ["performance", "optimize", "cache", "speed", "latency", "reliability", "retry", "error handling", "resilience"], found: [] },
+      { label: "Accessibility", keywords: ["accessibility", "a11y", "keyboard", "screen reader", "aria", "focus", "wcag"], found: [] },
+      { label: "UX improvements", keywords: ["ux", "usability", "truncat", "overflow", "responsive", "viewport", "layout", "styling", "modal", "dialog", "button"], found: [] },
+      { label: "Feature development", keywords: ["implement", "add", "create", "new", "introduce", "ship", "launch", "enable"], found: [] },
+      { label: "Bug fixes", keywords: ["fix", "bug", "broken", "regression", "resolve", "patch"], found: [] },
+      { label: "Code quality", keywords: ["refactor", "cleanup", "remove feature flag", "graduate", "deprecat", "migrate", "tech debt"], found: [] },
+      { label: "Debugging & observability", keywords: ["debug", "log", "monitor", "trace", "observ", "metric"], found: [] },
+    ];
 
-    for (const [area, count] of topAreas) {
-      lines.push(`- Contributed to **${area}** (${count} item${count !== 1 ? "s" : ""})`);
+    for (const title of allTitles) {
+      for (const theme of themeKeywords) {
+        if (theme.keywords.some((kw) => title.includes(kw))) {
+          theme.found.push(title);
+        }
+      }
+    }
+
+    const activeThemes = themeKeywords.filter((t) => t.found.length > 0).sort((a, b) => b.found.length - a.found.length);
+
+    if (activeThemes.length > 0) {
+      for (const theme of activeThemes.slice(0, 5)) {
+        lines.push(`- **${theme.label}**: ${theme.found.length} item${theme.found.length !== 1 ? "s" : ""} across ${
+          new Set([...allPrs, ...allIssues]
+            .filter((i) => theme.keywords.some((kw) => (i.title ?? "").toLowerCase().includes(kw)))
+            .map((i) => repoToArea(i._source_repo ?? ""))
+          ).size
+        } area(s)`);
+      }
+    }
+
+    lines.push("");
+
+    // Area summary with counts
+    for (const theme of prThemes) {
+      const issueTheme = issueThemes.find((t) => t.area === theme.area);
+      const issueCount = issueTheme?.rawCount ?? 0;
+      const reviewCount = prReviews.filter((r) => repoToArea(r._source_repo ?? "") === theme.area).length;
+      const parts: string[] = [`${theme.rawCount} PRs shipped`];
+      if (reviewCount > 0) parts.push(`${reviewCount} reviews`);
+      if (issueCount > 0) parts.push(`${issueCount} issues closed`);
+      lines.push(`- **${theme.area}**: ${parts.join(", ")}`);
+    }
+    for (const theme of issueThemes) {
+      if (!prThemes.find((t) => t.area === theme.area)) {
+        lines.push(`- **${theme.area}**: ${theme.rawCount} issues closed`);
+      }
     }
   }
   lines.push("");
@@ -199,16 +401,21 @@ function generateMonthlyMarkdown(
   // --- Highlights ---
   lines.push("## Highlights");
   lines.push("");
-  // Pick top 3 PRs by title length as a proxy for "substantial work"
-  const topPrs = dedup(
-    allPrs
-      .sort((a, b) => (b.title?.length ?? 0) - (a.title?.length ?? 0))
-      .map((p) => sanitize(p.title ?? ""))
-  ).slice(0, 3);
+  // Pick top PRs that have the richest body descriptions (most impact detail)
+  const prsWithDesc = allPrs
+    .map((p) => ({ item: p, line: buildItemLine(p), descLen: extractDescription(p.body).length }))
+    .filter((p) => p.descLen > 20)
+    .sort((a, b) => b.descLen - a.descLen);
 
-  if (topPrs.length > 0) {
-    for (const title of topPrs) {
-      lines.push(`- ${title}`);
+  const topHighlights = dedup(
+    prsWithDesc.length > 0
+      ? prsWithDesc.map((p) => p.line)
+      : allPrs.map((p) => buildItemLine(p))
+  ).slice(0, 5);
+
+  if (topHighlights.length > 0) {
+    for (const line of topHighlights) {
+      lines.push(`- ${line}`);
     }
   } else {
     lines.push("_No notable highlights this month._");
@@ -224,31 +431,63 @@ function generateMonthlyMarkdown(
     for (const theme of prThemes) {
       lines.push(`### ${theme.area}`);
       lines.push("");
-      const titles = dedup(theme.items).slice(0, 10);
-      for (const t of titles) {
-        lines.push(`- ${t}`);
+      const items = dedup(theme.items).slice(0, 8);
+      for (const line of items) {
+        lines.push(`- ${line}`);
       }
-      if (theme.items.length > 10) {
-        lines.push(`- _...and ${theme.items.length - 10} more_`);
+      if (theme.rawCount > 8) {
+        lines.push(`- _...and ${theme.rawCount - 8} more_`);
       }
       lines.push("");
     }
   }
 
-  // --- Reviews ---
-  lines.push("## Reviews");
+  // --- Reviews & Technical Leadership ---
+  lines.push("## Code Reviews & Technical Leadership");
   lines.push("");
   if (prReviews.length === 0) {
     lines.push("_No PR reviews this month._");
   } else {
-    // Group reviews by area
-    const reviewAreas = new Map<string, number>();
+    // Count unique PRs reviewed and review types
+    const uniquePRs = new Set(prReviews.map((r) => `${r._source_repo}:${r.pull_number}`));
+    const approvals = prReviews.filter((r) => r.state === "APPROVED").length;
+    const changesRequested = prReviews.filter((r) => r.state === "CHANGES_REQUESTED").length;
+    const commented = prReviews.filter((r) => r.state === "COMMENTED").length;
+
+    lines.push(`Reviewed **${uniquePRs.size} PRs** across ${new Set(prReviews.map((r) => repoToArea(r._source_repo ?? ""))).size} area(s):`);
+    lines.push("");
+    const reviewParts: string[] = [];
+    if (approvals > 0) reviewParts.push(`${approvals} approval${approvals !== 1 ? "s" : ""}`);
+    if (changesRequested > 0) reviewParts.push(`${changesRequested} change request${changesRequested !== 1 ? "s" : ""}`);
+    if (commented > 0) reviewParts.push(`${commented} review comment${commented !== 1 ? "s" : ""}`);
+    lines.push(`- ${reviewParts.join(", ")}`);
+
+    // Group by area
+    const reviewByArea = new Map<string, { count: number; prs: Set<string> }>();
     for (const r of prReviews) {
       const area = repoToArea(r._source_repo ?? "");
-      reviewAreas.set(area, (reviewAreas.get(area) ?? 0) + 1);
+      if (!reviewByArea.has(area)) reviewByArea.set(area, { count: 0, prs: new Set() });
+      const entry = reviewByArea.get(area)!;
+      entry.count++;
+      entry.prs.add(`${r._source_repo}:${r.pull_number}`);
     }
-    for (const [area, count] of Array.from(reviewAreas.entries()).sort((a, b) => b[1] - a[1])) {
-      lines.push(`- Reviewed ${count} PR${count !== 1 ? "s" : ""} in **${area}**`);
+    for (const [area, data] of Array.from(reviewByArea.entries()).sort((a, b) => b[1].prs.size - a[1].prs.size)) {
+      lines.push(`- **${area}**: reviewed ${data.prs.size} PR${data.prs.size !== 1 ? "s" : ""}`);
+    }
+
+    // Highlight substantive review comments
+    const substantiveComments = prComments
+      .map((c) => cleanCommentBody(c.body ?? "", 200))
+      .filter((b) => b.length > 50 && !b.match(/^\s*\W+\s*$/)); // skip emoji-only
+
+    if (substantiveComments.length > 0) {
+      lines.push("");
+      lines.push("**Notable review feedback given:**");
+      lines.push("");
+      for (const comment of substantiveComments.slice(0, 4)) {
+        lines.push(`> ${comment}`);
+        lines.push("");
+      }
     }
   }
   lines.push("");
@@ -262,33 +501,42 @@ function generateMonthlyMarkdown(
     for (const theme of issueThemes) {
       lines.push(`### ${theme.area}`);
       lines.push("");
-      const titles = dedup(theme.items).slice(0, 10);
-      for (const t of titles) {
-        lines.push(`- ${t}`);
+      const items = dedup(theme.items).slice(0, 8);
+      for (const line of items) {
+        lines.push(`- ${line}`);
       }
-      if (theme.items.length > 10) {
-        lines.push(`- _...and ${theme.items.length - 10} more_`);
+      if (theme.rawCount > 8) {
+        lines.push(`- _...and ${theme.rawCount - 8} more_`);
       }
       lines.push("");
     }
   }
 
-  // --- Collaboration ---
-  lines.push("## Collaboration");
-  lines.push("");
-  if (totalComments === 0) {
-    lines.push("_No comments this month._");
-  } else {
-    const commentAreas = new Map<string, number>();
-    for (const c of [...issueComments, ...prComments]) {
-      const area = repoToArea(c._source_repo ?? "");
-      commentAreas.set(area, (commentAreas.get(area) ?? 0) + 1);
+  // --- Cross-team Engagement ---
+  const allComments = [...issueComments, ...prComments];
+  const commentAreas = new Set(allComments.map((c) => repoToArea(c._source_repo ?? "")));
+  const cleanedIssueComments = issueComments
+    .map((c) => cleanCommentBody(c.body ?? "", 220))
+    .filter((b) => b.length > 60 && !b.match(/^\s*\W+\s*$/));
+
+  if (cleanedIssueComments.length > 0 || commentAreas.size > 1) {
+    lines.push("## Cross-team Engagement");
+    lines.push("");
+
+    if (commentAreas.size > 1) {
+      lines.push(`Active across **${commentAreas.size} areas**: ${Array.from(commentAreas).join(", ")}`);
+      lines.push("");
     }
-    for (const [area, count] of Array.from(commentAreas.entries()).sort((a, b) => b[1] - a[1])) {
-      lines.push(`- ${count} comment${count !== 1 ? "s" : ""} on **${area}**`);
+
+    if (cleanedIssueComments.length > 0) {
+      lines.push("**Key discussion contributions:**");
+      lines.push("");
+      for (const discussion of cleanedIssueComments.slice(0, 3)) {
+        lines.push(`> ${discussion}`);
+        lines.push("");
+      }
     }
   }
-  lines.push("");
 
   // --- Numbers ---
   lines.push("## Numbers");

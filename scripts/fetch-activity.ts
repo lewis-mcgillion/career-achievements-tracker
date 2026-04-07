@@ -171,6 +171,72 @@ async function searchItems(
   return items;
 }
 
+// ---------------------------------------------------------------------------
+// PR diff stats enrichment — adds additions, deletions, changed_files, files
+// ---------------------------------------------------------------------------
+
+interface PRDiffStats {
+  additions: number;
+  deletions: number;
+  changed_files: number;
+  files: Array<{ filename: string; additions: number; deletions: number; status: string }>;
+}
+
+async function enrichPRsWithDiffStats(
+  octokit: Octokit, owner: string, repo: string, prs: unknown[], label: string
+): Promise<unknown[]> {
+  if (prs.length === 0) return prs;
+  console.log(`        ${label}: enriching ${prs.length} PRs with diff stats...`);
+
+  const enriched: unknown[] = [];
+  let enrichedCount = 0;
+
+  for (const pr of prs) {
+    const prObj = pr as { number: number };
+    try {
+      // Get PR detail (includes additions, deletions, changed_files)
+      const { data: detail } = await safeFetch(`${label}-detail`, () =>
+        octokit.rest.pulls.get({ owner, repo, pull_number: prObj.number })
+      );
+
+      // Get file list (includes per-file stats)
+      const files = await safeFetch(`${label}-files`, () =>
+        octokit.paginate(octokit.rest.pulls.listFiles, {
+          owner, repo, pull_number: prObj.number, per_page: 100,
+        })
+      );
+
+      const diffStats: PRDiffStats = {
+        additions: detail.additions,
+        deletions: detail.deletions,
+        changed_files: detail.changed_files,
+        files: files.map((f: { filename: string; additions: number; deletions: number; status: string }) => ({
+          filename: f.filename,
+          additions: f.additions,
+          deletions: f.deletions,
+          status: f.status,
+        })),
+      };
+
+      enriched.push({ ...prObj, _diff_stats: diffStats });
+      enrichedCount++;
+
+      // Brief pause to be nice to API
+      if (enrichedCount % 10 === 0) {
+        console.log(`        ${label}: ${enrichedCount}/${prs.length} enriched`);
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    } catch {
+      // If enrichment fails, keep the PR without stats
+      enriched.push(pr);
+      console.warn(`        ⚠ Could not enrich a PR with diff stats, skipping`);
+    }
+  }
+
+  console.log(`        ${label}: ${enrichedCount}/${prs.length} PRs enriched with diff stats`);
+  return enriched;
+}
+
 async function fetchIssuesCreated(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
@@ -189,14 +255,16 @@ async function fetchPRsCreated(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
   const q = `repo:${owner}/${repo} is:pr is:merged author:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
-  return searchItems(octokit, q, "prs-created");
+  const prs = await searchItems(octokit, q, "prs-created");
+  return enrichPRsWithDiffStats(octokit, owner, repo, prs, "prs-created");
 }
 
 async function fetchPRsAssigned(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
   const q = `repo:${owner}/${repo} is:pr is:merged assignee:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
-  return searchItems(octokit, q, "prs-assigned");
+  const prs = await searchItems(octokit, q, "prs-assigned");
+  return enrichPRsWithDiffStats(octokit, owner, repo, prs, "prs-assigned");
 }
 
 async function fetchPRReviews(
