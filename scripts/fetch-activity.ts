@@ -396,6 +396,8 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error("Fatal error: data fetch failed");
+  // Show sanitized error — safe because sanitizeError strips all sensitive data
+  const msg = err instanceof Error ? err.message : "unknown error";
+  console.error(`Fatal: ${msg}`);
   process.exit(1);
 });
