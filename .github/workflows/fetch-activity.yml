@@ -14,13 +14,17 @@ on:
         description: "End date (YYYY-MM-DD) for backfill. Defaults to end of previous month."
         required: false
         type: string
+      force_regenerate:
+        description: "Regenerate achievement files even if they already exist"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
-  issues: write
 
 jobs:
-  fetch:
+  fetch-and-generate:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout public repo
@@ -35,6 +39,16 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Clone private career-data repo
+        env:
+          PAT: ${{ secrets.CAREER_DATA_PAT }}
+        run: |
+          git -c "credential.helper=!f(){ echo username=x-access-token; echo password=${PAT}; };f" \
+            clone https://github.com/${{ github.repository_owner }}/career-data.git /tmp/career-data
+          echo "✅ career-data cloned"
+          echo "Existing data months:"
+          ls /tmp/career-data/data/ 2>/dev/null || echo "  (none)"
 
       - name: Determine date range
         id: dates
@@ -60,7 +74,7 @@ jobs:
             echo "end_date=$(date -d "$(date '+%Y-%m-01') - 1 day" '+%Y-%m-%d' 2>/dev/null || date -v1d -v-1d '+%Y-%m-%d')" >> "$GITHUB_OUTPUT"
           fi
 
-          # Compute target months list (YYYY-MM) from date range for the summary issue
+          # Compute target months list (YYYY-MM) from date range
           START="${INPUT_START_DATE:-$(date -d 'last month' '+%Y-%m-01' 2>/dev/null || date -v-1m '+%Y-%m-01')}"
           END="${INPUT_END_DATE:-$(date -d "$(date '+%Y-%m-01') - 1 day" '+%Y-%m-%d' 2>/dev/null || date -v1d -v-1d '+%Y-%m-%d')}"
           MONTHS=""
@@ -69,102 +83,101 @@ jobs:
           while [ "$CUR" \< "$END_M" ] || [ "$CUR" = "$END_M" ]; do
             [ -n "$MONTHS" ] && MONTHS="$MONTHS,"
             MONTHS="$MONTHS$CUR"
-            # Advance by one month
             NEXT=$(date -d "${CUR}-01 + 1 month" '+%Y-%m' 2>/dev/null || date -j -v+1m -f '%Y-%m-%d' "${CUR}-01" '+%Y-%m')
             CUR="$NEXT"
           done
           echo "months=$MONTHS" >> "$GITHUB_OUTPUT"
 
+      - name: Determine months to fetch
+        id: skip
+        run: |
+          # Check which months already have data in career-data
+          IFS=',' read -ra ALL_MONTHS <<< "${{ steps.dates.outputs.months }}"
+          NEED_FETCH=""
+          ALREADY_HAVE=""
+          for M in "${ALL_MONTHS[@]}"; do
+            if [ -d "/tmp/career-data/data/$M" ] && [ -f "/tmp/career-data/data/$M/prs-created.json" ]; then
+              [ -n "$ALREADY_HAVE" ] && ALREADY_HAVE="$ALREADY_HAVE,"
+              ALREADY_HAVE="$ALREADY_HAVE$M"
+            else
+              [ -n "$NEED_FETCH" ] && NEED_FETCH="$NEED_FETCH,"
+              NEED_FETCH="$NEED_FETCH$M"
+            fi
+          done
+
+          echo "need_fetch=$NEED_FETCH" >> "$GITHUB_OUTPUT"
+          echo "already_have=$ALREADY_HAVE" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$ALREADY_HAVE" ]; then
+            echo "⏭  Already have data for: $ALREADY_HAVE"
+          fi
+          if [ -n "$NEED_FETCH" ]; then
+            echo "📥 Need to fetch: $NEED_FETCH"
+          else
+            echo "✅ All requested months already have data — skipping fetch"
+          fi
+
       - name: Fetch activity data
+        if: steps.skip.outputs.need_fetch != ''
         env:
           GITHUB_TOKEN: ${{ secrets.CAREER_DATA_PAT }}
           TRACKED_REPOS: ${{ secrets.TRACKED_REPOS }}
         run: |
+          # Compute date range from the months that need fetching
+          IFS=',' read -ra FETCH_MONTHS <<< "${{ steps.skip.outputs.need_fetch }}"
+          FIRST="${FETCH_MONTHS[0]}"
+          LAST="${FETCH_MONTHS[${#FETCH_MONTHS[@]}-1]}"
+          FETCH_START="${FIRST}-01"
+          # End date = last day of the last month
+          FETCH_END=$(date -d "${LAST}-01 + 1 month - 1 day" '+%Y-%m-%d' 2>/dev/null || \
+            date -j -v+1m -v-1d -f '%Y-%m-%d' "${LAST}-01" '+%Y-%m-%d')
+
+          echo "Fetching from $FETCH_START to $FETCH_END"
           npx tsx scripts/fetch-activity.ts \
-            --start-date "${{ steps.dates.outputs.start_date }}" \
-            --end-date "${{ steps.dates.outputs.end_date }}" \
+            --start-date "$FETCH_START" \
+            --end-date "$FETCH_END" \
             --username "${{ github.repository_owner }}" \
             --output-dir "./fetched-data"
 
-      - name: Push data to private career-data repo
+      - name: Copy fetched data to career-data
+        if: steps.skip.outputs.need_fetch != ''
+        run: |
+          cp -r ./fetched-data/* /tmp/career-data/data/ 2>/dev/null || true
+
+      - name: Generate achievement summaries
+        env:
+          FORCE_REGEN: ${{ inputs.force_regenerate }}
+        run: |
+          FORCE_FLAG=""
+          if [ "$FORCE_REGEN" = "true" ]; then
+            FORCE_FLAG="--force"
+          fi
+
+          npx tsx scripts/generate-achievements.ts \
+            --data-dir "/tmp/career-data/data" \
+            --achievements-dir "/tmp/career-data/achievements" \
+            --months "${{ steps.dates.outputs.months }}" \
+            $FORCE_FLAG
+
+      - name: Commit and push to career-data
         env:
           PAT: ${{ secrets.CAREER_DATA_PAT }}
         run: |
-          # Clone using credential helper to avoid PAT in URLs/logs
-          git -c "credential.helper=!f(){ echo username=x-access-token; echo password=${PAT}; };f" \
-            clone https://github.com/${{ github.repository_owner }}/career-data.git /tmp/career-data
-          cp -r ./fetched-data/* /tmp/career-data/data/ 2>/dev/null || true
           cd /tmp/career-data
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
-            echo "No new data to commit"
+            echo "No changes to commit"
           else
-            git commit -q -m "data: activity fetch
+            git diff --cached --stat
+            git commit -q -m "update: activity data and achievements
 
           Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
             git -c "credential.helper=!f(){ echo username=x-access-token; echo password=${PAT}; };f" \
               push -q
-            echo "✅ Data pushed"
+            echo "✅ Changes pushed to career-data"
           fi
-
-      - name: Create Copilot agent issue
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET_MONTHS: ${{ steps.dates.outputs.months }}
-        run: |
-          ISSUE_BODY=$(cat <<'ISSUE_EOF'
-          ## Task: Generate Achievement Summary
-
-          Generate achievement summaries for the following months: **TARGET_MONTHS_PLACEHOLDER**
-
-          ### Instructions
-
-          1. **Read the raw data** from the private data repo already cloned at
-             `/tmp/career-data`. Read JSON files from `/tmp/career-data/data/YYYY-MM/`:
-             - `issues-created.json` — Issues I opened
-             - `issues-assigned.json` — Issues assigned to me
-             - `prs-created.json` — PRs I authored
-             - `prs-assigned.json` — PRs assigned to me
-             - `pr-reviews.json` — PR reviews I performed
-             - `issue-comments.json` — My issue comments
-             - `pr-comments.json` — My PR review comments
-
-          2. **Generate/update a monthly achievement file** at `/tmp/career-data/achievements/YYYY-MM.md`:
-             - Use the template at `/tmp/career-data/achievements/TEMPLATE.md` for structure
-             - Follow ALL sanitization rules in `.github/copilot-instructions.md`
-             - Focus on impact, themes, and accomplishments — NOT raw activity
-
-          3. **Update `/tmp/career-data/achievements/SUMMARY.md`**:
-             - Add/update the entry for each processed month
-             - Keep entries in chronological order
-
-          4. **Commit and push to the private repo only**:
-             ```bash
-             cd /tmp/career-data
-             git add achievements/*.md
-             git diff --cached --stat  # verify only .md files staged
-             git commit -m "Update achievements for TARGET_MONTHS_PLACEHOLDER"
-             git push
-             ```
-
-          ### Important Reminders
-          - Read `.github/copilot-instructions.md` for full sanitization and safety rules
-          - ALL output goes to the PRIVATE career-data repo, not the public profile repo
-          - NEVER include internal repo names, issue numbers, or direct links
-          - NEVER print JSON file contents to stdout (your output is visible here)
-          - NEVER run `git add .` — only `git add achievements/*.md`
-          - NEVER read files in `/tmp/career-data/.git/`
-          ISSUE_EOF
-          )
-
-          ISSUE_BODY="${ISSUE_BODY//TARGET_MONTHS_PLACEHOLDER/$TARGET_MONTHS}"
-
-          gh issue create \
-            --title "Generate achievement summary for ${TARGET_MONTHS}" \
-            --body "$ISSUE_BODY" \
-            --label "copilot"
 
       - name: Clean up sensitive data
         if: always()

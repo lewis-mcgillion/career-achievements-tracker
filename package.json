@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "fetch": "tsx scripts/fetch-activity.ts",
+    "generate": "tsx scripts/generate-achievements.ts",
     "bootstrap": "tsx scripts/bootstrap.ts",
     "test": "vitest run",
     "test:watch": "vitest"
