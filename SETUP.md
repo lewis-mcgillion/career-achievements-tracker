@@ -64,8 +64,7 @@ Copy these files/directories to your repo (or fork this repo directly):
 ├── copilot-instructions.md
 ├── copilot-setup-steps.yml
 └── workflows/
-    ├── fetch-activity.yml
-    └── generate-summary.yml
+    └── fetch-activity.yml
 scripts/
 ├── fetch-activity.ts
 └── bootstrap.ts
@@ -128,7 +127,7 @@ git push
 
 ### Monthly Cron (Automatic)
 
-The `fetch-activity` workflow runs automatically at midnight UTC on the 1st of every month. After fetching data, it triggers the `generate-summary` workflow which creates a GitHub issue for the Copilot agent to generate that month's achievement summary.
+The `fetch-activity` workflow runs automatically at midnight UTC on the 1st of every month. After fetching data, it pushes the JSON to your private repo and creates a GitHub issue with the `copilot` label to trigger the Copilot coding agent to generate that month's achievement summary.
 
 **No action needed** — it just works!
 
@@ -143,20 +142,17 @@ gh workflow run fetch-activity.yml \
   -f end_date=$(date '+%Y-%m-%d')
 ```
 
-Then trigger the summary generation for all months:
-
-```bash
-gh workflow run generate-summary.yml \
-  --repo <username>/career-achievements-tracker \
-  -f months="2025-01,2025-02,2025-03"
-```
+The workflow automatically creates the Copilot agent issue after a successful fetch.
 
 ### Re-generate a Specific Month
 
+Re-run the fetch workflow for a specific month to re-trigger the Copilot agent:
+
 ```bash
-gh workflow run generate-summary.yml \
+gh workflow run fetch-activity.yml \
   --repo <username>/career-achievements-tracker \
-  -f months="2025-06"
+  -f start_date=2025-06-01 \
+  -f end_date=2025-06-30
 ```
 
 ## Customization
