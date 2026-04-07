@@ -68,7 +68,7 @@ jobs:
             --start-date "${{ steps.dates.outputs.start_date }}" \
             --end-date "${{ steps.dates.outputs.end_date }}" \
             --username "${{ github.repository_owner }}" \
-            --output-dir "./fetched-data" 2>&1 | head -500
+            --output-dir "./fetched-data" 2>&1 | head -2000
 
       - name: Push data to private career-data repo
         env:

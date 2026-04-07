@@ -43,7 +43,6 @@ function parseArgs(): Args {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Generates [startOfMonth, endOfMonth] pairs between two dates. */
 function monthRanges(start: string, end: string): Array<{ year: string; month: string; since: string; until: string }> {
   const ranges: Array<{ year: string; month: string; since: string; until: string }> = [];
   let cursor = startOfMonth(parseISO(start));
@@ -66,102 +65,150 @@ async function writeJson(dir: string, filename: string, data: unknown): Promise<
   await mkdir(dir, { recursive: true });
   const path = join(dir, filename);
   await writeFile(path, JSON.stringify(data, null, 2), "utf-8");
-  console.log(`  ✓ ${filename} (${Array.isArray(data) ? data.length : 0} items)`);
+  console.log(`      ✓ ${filename} (${Array.isArray(data) ? data.length : 0} items)`);
 }
 
 // ---------------------------------------------------------------------------
-// Data fetching functions
+// Error sanitization
 // ---------------------------------------------------------------------------
+
+let _orgNames: string[] = [];
+let _repoNames: string[] = [];
+let _username: string = "";
+
+function setRedactTargets(repos: string[], username: string): void {
+  _orgNames = [...new Set(repos.map((r) => r.split("/")[0]))];
+  _repoNames = [...new Set(repos.map((r) => r.split("/")[1]).filter(Boolean))];
+  _username = username;
+}
+
+function sanitizeError(err: unknown): string {
+  const e = err as { status?: number; message?: string };
+  if (e.status) return `HTTP ${e.status}`;
+  let msg = String(e.message ?? "unknown error");
+  msg = msg.replace(/https?:\/\/[^\s]+/g, "[redacted-url]");
+  msg = msg.replace(/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+/g, "[redacted]");
+  msg = msg.replace(/"owner":\s*"[^"]+"/g, '"owner":"[redacted]"');
+  msg = msg.replace(/"repo":\s*"[^"]+"/g, '"repo":"[redacted]"');
+  msg = msg.replace(/"repository":\s*"[^"]+"/g, '"repository":"[redacted]"');
+  for (const name of [..._orgNames, ..._repoNames]) {
+    if (name.length >= 3) {
+      msg = msg.replace(new RegExp(`\\b${name}\\b`, "gi"), "[redacted]");
+    }
+  }
+  if (_username && _username.length >= 3) {
+    msg = msg.replace(new RegExp(`\\b${_username}\\b`, "gi"), "[redacted-user]");
+  }
+  return msg;
+}
+
+// ---------------------------------------------------------------------------
+// Resilient fetch with retries (5xx + rate limits)
+// ---------------------------------------------------------------------------
+
+async function safeFetch<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  const maxRetries = 4;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      const e = err as { status?: number; response?: { headers?: Record<string, string> } };
+      const status = e.status ?? 0;
+
+      // Retry on server errors (5xx)
+      if (status >= 500 && attempt < maxRetries) {
+        const waitMs = attempt * 15_000; // 15s, 30s, 45s
+        console.warn(`      ⚠ ${label}: HTTP ${status}, retry ${attempt}/${maxRetries} in ${waitMs / 1000}s...`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+
+      // Rate limits (403/429)
+      if (status === 403 || status === 429) {
+        const resetHeader = e.response?.headers?.["x-ratelimit-reset"];
+        const resetTime = resetHeader ? parseInt(resetHeader, 10) * 1000 : Date.now() + 60_000;
+        const waitMs = Math.max(resetTime - Date.now(), 5_000);
+        console.warn(`      ⏳ ${label}: rate limited, waiting ${Math.round(waitMs / 1000)}s...`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        if (attempt < maxRetries) continue;
+      }
+
+      // Secondary rate limit (abuse detection) — often returned as 403 with retry-after
+      const retryAfter = e.response?.headers?.["retry-after"];
+      if (retryAfter && attempt < maxRetries) {
+        const waitMs = parseInt(retryAfter, 10) * 1000 || 30_000;
+        console.warn(`      ⏳ ${label}: retry-after ${waitMs / 1000}s...`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+
+      throw new Error(`${label}: ${sanitizeError(err)}`);
+    }
+  }
+  throw new Error(`${label}: max retries exceeded`);
+}
+
+// ---------------------------------------------------------------------------
+// Search-based fetch functions (more efficient than listForRepo on large repos)
+// ---------------------------------------------------------------------------
+
+async function searchItems(
+  octokit: Octokit, query: string, label: string
+): Promise<unknown[]> {
+  const items: unknown[] = [];
+  let page = 1;
+  while (true) {
+    const resp = await octokit.rest.search.issuesAndPullRequests({
+      q: query, per_page: 100, page, sort: "created", order: "asc",
+    });
+    items.push(...resp.data.items);
+    console.log(`        ${label} page ${page}: ${resp.data.items.length} items (${items.length}/${resp.data.total_count} total)`);
+    if (items.length >= resp.data.total_count || resp.data.items.length === 0) break;
+    page++;
+    // Pace ourselves — search API has a 30 req/min limit
+    if (page % 3 === 0) await new Promise((r) => setTimeout(r, 2000));
+  }
+  return items;
+}
 
 async function fetchIssuesCreated(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
-  const items: unknown[] = [];
-  const iterator = octokit.paginate.iterator(octokit.rest.issues.listForRepo, {
-    owner, repo, creator: username, state: "all", since, per_page: 100,
-  });
-  for await (const { data } of iterator) {
-    for (const issue of data) {
-      if (issue.pull_request) continue; // skip PRs
-      const created = new Date(issue.created_at);
-      if (created >= new Date(since) && created <= new Date(until)) {
-        items.push(issue);
-      }
-    }
-  }
-  return items;
+  const q = `repo:${owner}/${repo} is:issue author:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
+  return searchItems(octokit, q, "issues-created");
 }
 
 async function fetchIssuesAssigned(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
-  const items: unknown[] = [];
-  const iterator = octokit.paginate.iterator(octokit.rest.issues.listForRepo, {
-    owner, repo, assignee: username, state: "all", since, per_page: 100,
-  });
-  for await (const { data } of iterator) {
-    for (const issue of data) {
-      if (issue.pull_request) continue;
-      const created = new Date(issue.created_at);
-      if (created >= new Date(since) && created <= new Date(until)) {
-        items.push(issue);
-      }
-    }
-  }
-  return items;
+  const q = `repo:${owner}/${repo} is:issue assignee:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
+  return searchItems(octokit, q, "issues-assigned");
 }
 
 async function fetchPRsCreated(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
-  const items: unknown[] = [];
-  const query = `repo:${owner}/${repo} is:pr author:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
-  let page = 1;
-  while (true) {
-    const resp = await octokit.rest.search.issuesAndPullRequests({
-      q: query, per_page: 100, page, sort: "created", order: "asc",
-    });
-    items.push(...resp.data.items);
-    if (items.length >= resp.data.total_count) break;
-    page++;
-  }
-  return items;
+  const q = `repo:${owner}/${repo} is:pr author:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
+  return searchItems(octokit, q, "prs-created");
 }
 
 async function fetchPRsAssigned(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
-  const items: unknown[] = [];
-  const query = `repo:${owner}/${repo} is:pr assignee:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
-  let page = 1;
-  while (true) {
-    const resp = await octokit.rest.search.issuesAndPullRequests({
-      q: query, per_page: 100, page, sort: "created", order: "asc",
-    });
-    items.push(...resp.data.items);
-    if (items.length >= resp.data.total_count) break;
-    page++;
-  }
-  return items;
+  const q = `repo:${owner}/${repo} is:pr assignee:${username} created:${since.slice(0, 10)}..${until.slice(0, 10)}`;
+  return searchItems(octokit, q, "prs-assigned");
 }
 
 async function fetchPRReviews(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
-  const reviews: unknown[] = [];
-  const query = `repo:${owner}/${repo} is:pr reviewed-by:${username} updated:${since.slice(0, 10)}..${until.slice(0, 10)}`;
-  let page = 1;
-  let prItems: Array<{ number: number }> = [];
-  while (true) {
-    const resp = await octokit.rest.search.issuesAndPullRequests({
-      q: query, per_page: 100, page, sort: "updated", order: "asc",
-    });
-    prItems.push(...resp.data.items.map((i) => ({ number: i.number })));
-    if (prItems.length >= resp.data.total_count) break;
-    page++;
-  }
+  // First find PRs the user reviewed, then fetch their actual reviews
+  const q = `repo:${owner}/${repo} is:pr reviewed-by:${username} updated:${since.slice(0, 10)}..${until.slice(0, 10)}`;
+  const prItems = await searchItems(octokit, q, "pr-reviews-search");
 
-  for (const pr of prItems) {
+  const reviews: unknown[] = [];
+  for (const prItem of prItems) {
+    const pr = prItem as { number: number };
     try {
       const prReviews = await octokit.paginate(octokit.rest.pulls.listReviews, {
         owner, repo, pull_number: pr.number, per_page: 100,
@@ -178,123 +225,88 @@ async function fetchPRReviews(
         }
       }
     } catch {
-      console.warn(`  ⚠ Could not fetch reviews for a PR`);
+      console.warn(`        ⚠ Could not fetch reviews for a PR, skipping`);
     }
   }
+  console.log(`        pr-reviews: ${reviews.length} reviews from ${prItems.length} PRs`);
   return reviews;
 }
 
 async function fetchIssueComments(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
+  // Use search to find issues the user commented on, then fetch comments
+  const q = `repo:${owner}/${repo} is:issue commenter:${username} updated:${since.slice(0, 10)}..${until.slice(0, 10)}`;
+  const issues = await searchItems(octokit, q, "issue-comments-search");
+
   const comments: unknown[] = [];
-  const iterator = octokit.paginate.iterator(octokit.rest.issues.listCommentsForRepo, {
-    owner, repo, since, sort: "created", direction: "asc", per_page: 100,
-  });
-  for await (const { data } of iterator) {
-    for (const comment of data) {
-      const c = comment as { user?: { login?: string }; created_at: string };
-      const created = new Date(c.created_at);
-      if (created > new Date(until)) return comments; // past our window
-      if (c.user?.login === username && created >= new Date(since)) {
-        comments.push(comment);
+  for (const issue of issues) {
+    const iss = issue as { number: number };
+    try {
+      const issueComments = await octokit.paginate(octokit.rest.issues.listComments, {
+        owner, repo, issue_number: iss.number, since, per_page: 100,
+      });
+      for (const comment of issueComments) {
+        const c = comment as { user?: { login?: string }; created_at: string };
+        const created = new Date(c.created_at);
+        if (c.user?.login === username && created >= new Date(since) && created <= new Date(until)) {
+          comments.push(comment);
+        }
       }
+    } catch {
+      console.warn(`        ⚠ Could not fetch comments for an issue, skipping`);
     }
   }
+  console.log(`        issue-comments: ${comments.length} comments from ${issues.length} issues`);
   return comments;
 }
 
 async function fetchPRComments(
   octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
 ): Promise<unknown[]> {
+  // Use search to find PRs the user commented on, then fetch review comments
+  const q = `repo:${owner}/${repo} is:pr commenter:${username} updated:${since.slice(0, 10)}..${until.slice(0, 10)}`;
+  const prs = await searchItems(octokit, q, "pr-comments-search");
+
   const comments: unknown[] = [];
-  const iterator = octokit.paginate.iterator(octokit.rest.pulls.listReviewCommentsForRepo, {
-    owner, repo, since, sort: "created", direction: "asc", per_page: 100,
-  });
-  for await (const { data } of iterator) {
-    for (const comment of data) {
-      const c = comment as { user?: { login?: string }; created_at: string };
-      const created = new Date(c.created_at);
-      if (created > new Date(until)) return comments;
-      if (c.user?.login === username && created >= new Date(since)) {
-        comments.push(comment);
+  for (const prItem of prs) {
+    const pr = prItem as { number: number };
+    try {
+      const prComments = await octokit.paginate(octokit.rest.pulls.listReviewComments, {
+        owner, repo, pull_number: pr.number, since, per_page: 100,
+      });
+      for (const comment of prComments) {
+        const c = comment as { user?: { login?: string }; created_at: string };
+        const created = new Date(c.created_at);
+        if (c.user?.login === username && created >= new Date(since) && created <= new Date(until)) {
+          comments.push(comment);
+        }
       }
+    } catch {
+      console.warn(`        ⚠ Could not fetch comments for a PR, skipping`);
     }
   }
+  console.log(`        pr-comments: ${comments.length} comments from ${prs.length} PRs`);
   return comments;
 }
 
 // ---------------------------------------------------------------------------
-// Error sanitization — strip repo names, URLs, and sensitive data from errors
+// Fetch type definitions for clean iteration
 // ---------------------------------------------------------------------------
 
-/** Extracts unique org names from repo list for targeted redaction */
-let _orgNames: string[] = [];
-let _repoNames: string[] = [];
-function setRedactTargets(repos: string[]): void {
-  _orgNames = [...new Set(repos.map((r) => r.split("/")[0]))];
-  _repoNames = [...new Set(repos.map((r) => r.split("/")[1]).filter(Boolean))];
-}
+type FetchFn = (
+  octokit: Octokit, owner: string, repo: string, username: string, since: string, until: string
+) => Promise<unknown[]>;
 
-function sanitizeError(err: unknown, username?: string): string {
-  const e = err as { status?: number; message?: string };
-  if (e.status) return `HTTP ${e.status}`;
-  let msg = String(e.message ?? "unknown error");
-  // Strip URLs
-  msg = msg.replace(/https?:\/\/[^\s]+/g, "[redacted-url]");
-  // Strip org/repo patterns
-  msg = msg.replace(/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+/g, "[redacted]");
-  // Strip JSON-style field values for owner/repo
-  msg = msg.replace(/"owner":\s*"[^"]+"/g, '"owner":"[redacted]"');
-  msg = msg.replace(/"repo":\s*"[^"]+"/g, '"repo":"[redacted]"');
-  msg = msg.replace(/"repository":\s*"[^"]+"/g, '"repository":"[redacted]"');
-  // Strip known org and repo names as standalone words
-  for (const name of [..._orgNames, ..._repoNames]) {
-    if (name.length >= 3) { // avoid redacting tiny strings
-      msg = msg.replace(new RegExp(`\\b${name}\\b`, "gi"), "[redacted]");
-    }
-  }
-  // Strip username if provided
-  if (username && username.length >= 3) {
-    msg = msg.replace(new RegExp(`\\b${username}\\b`, "gi"), "[redacted-user]");
-  }
-  return msg;
-}
-
-/** Wraps a fetch function to catch ALL errors and sanitize them */
-async function safeFetch<T>(fn: () => Promise<T>, username?: string): Promise<T> {
-  const maxRetries = 3;
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (err: unknown) {
-      const e = err as { status?: number; response?: { headers?: Record<string, string> } };
-      // Retry on server errors (5xx)
-      if (e.status && e.status >= 500 && attempt < maxRetries) {
-        const waitMs = attempt * 10_000; // 10s, 20s
-        console.warn(`  ⚠ Server error, retrying in ${waitMs / 1000}s (attempt ${attempt}/${maxRetries})...`);
-        await new Promise((r) => setTimeout(r, waitMs));
-        continue;
-      }
-      // Handle rate limits with retry
-      if (e.status === 403 || e.status === 429) {
-        const resetHeader = e.response?.headers?.["x-ratelimit-reset"];
-        const resetTime = resetHeader ? parseInt(resetHeader, 10) * 1000 : Date.now() + 60_000;
-        const waitMs = Math.max(resetTime - Date.now(), 1000);
-        console.warn(`  ⏳ Rate limited, waiting...`);
-        await new Promise((r) => setTimeout(r, waitMs));
-        try {
-          return await fn();
-        } catch (retryErr: unknown) {
-          throw new Error(sanitizeError(retryErr, username));
-        }
-      }
-      // All other errors — sanitize and rethrow
-      throw new Error(sanitizeError(err, username));
-    }
-  }
-  throw new Error("Max retries exceeded");
-}
+const FETCH_TYPES: Array<{ name: string; filename: string; fn: FetchFn }> = [
+  { name: "issues-created",  filename: "issues-created.json",  fn: fetchIssuesCreated },
+  { name: "issues-assigned", filename: "issues-assigned.json", fn: fetchIssuesAssigned },
+  { name: "prs-created",     filename: "prs-created.json",     fn: fetchPRsCreated },
+  { name: "prs-assigned",    filename: "prs-assigned.json",    fn: fetchPRsAssigned },
+  { name: "pr-reviews",      filename: "pr-reviews.json",      fn: fetchPRReviews },
+  { name: "issue-comments",  filename: "issue-comments.json",  fn: fetchIssueComments },
+  { name: "pr-comments",     filename: "pr-comments.json",     fn: fetchPRComments },
+];
 
 // ---------------------------------------------------------------------------
 // Main
@@ -307,17 +319,20 @@ async function main(): Promise<void> {
   }
 
   const octokit = new Octokit({ auth: args.token });
+  setRedactTargets(args.repos, args.username);
 
-  // Register org/repo names for error redaction
-  setRedactTargets(args.repos);
-
-  // Verify authentication
+  // Verify authentication and check rate limit
   const { data: user } = await octokit.rest.users.getAuthenticated();
   console.log(`✓ Authenticated`);
+
+  const { data: rateLimit } = await octokit.rest.rateLimit.get();
+  console.log(`✓ Rate limit: ${rateLimit.resources.core.remaining}/${rateLimit.resources.core.limit} core, ${rateLimit.resources.search.remaining}/${rateLimit.resources.search.limit} search`);
 
   const ranges = monthRanges(args.startDate, args.endDate);
   console.log(`\nFetching data for ${ranges.length} month(s): ${ranges.map((r) => `${r.year}-${r.month}`).join(", ")}`);
   console.log(`Repos: ${args.repos.length} repo(s)\n`);
+
+  let totalErrors = 0;
 
   for (const range of ranges) {
     const monthLabel = `${range.year}-${range.month}`;
@@ -327,92 +342,55 @@ async function main(): Promise<void> {
 
     const monthDir = join(args.outputDir, monthLabel);
 
-    // Collect data from all repos for this month
-    const allIssuesCreated: unknown[] = [];
-    const allIssuesAssigned: unknown[] = [];
-    const allPRsCreated: unknown[] = [];
-    const allPRsAssigned: unknown[] = [];
-    const allPRReviews: unknown[] = [];
-    const allIssueComments: unknown[] = [];
-    const allPRComments: unknown[] = [];
+    // Per-type accumulators
+    const accumulated: Record<string, unknown[]> = {};
+    for (const ft of FETCH_TYPES) accumulated[ft.name] = [];
 
     for (const repoFull of args.repos) {
       const [owner, repo] = repoFull.split("/");
       const repoIndex = args.repos.indexOf(repoFull) + 1;
       console.log(`\n  📦 Repo ${repoIndex}/${args.repos.length}`);
 
-      try {
-        const issuesCreated = await safeFetch(
-          () => fetchIssuesCreated(octokit, owner, repo, args.username, range.since, range.until),
-          args.username
-        );
-        allIssuesCreated.push(...issuesCreated.map((i) => ({ ...i as object, _source_repo: repoFull })));
+      for (const ft of FETCH_TYPES) {
+        console.log(`    → ${ft.name}`);
+        try {
+          const items = await safeFetch(ft.name, () =>
+            ft.fn(octokit, owner, repo, args.username, range.since, range.until)
+          );
+          const tagged = items.map((i) => ({ ...i as object, _source_repo: repoFull }));
+          accumulated[ft.name].push(...tagged);
+          console.log(`    ✓ ${ft.name}: ${items.length} items`);
+        } catch (err) {
+          totalErrors++;
+          const msg = err instanceof Error ? err.message : "unknown error";
+          console.warn(`    ✗ ${ft.name}: FAILED — ${msg}`);
+        }
 
-        const issuesAssigned = await safeFetch(
-          () => fetchIssuesAssigned(octokit, owner, repo, args.username, range.since, range.until),
-          args.username
-        );
-        allIssuesAssigned.push(...issuesAssigned.map((i) => ({ ...i as object, _source_repo: repoFull })));
-
-        const prsCreated = await safeFetch(
-          () => fetchPRsCreated(octokit, owner, repo, args.username, range.since, range.until),
-          args.username
-        );
-        allPRsCreated.push(...prsCreated.map((i) => ({ ...i as object, _source_repo: repoFull })));
-
-        const prsAssigned = await safeFetch(
-          () => fetchPRsAssigned(octokit, owner, repo, args.username, range.since, range.until),
-          args.username
-        );
-        allPRsAssigned.push(...prsAssigned.map((i) => ({ ...i as object, _source_repo: repoFull })));
-
-        const prReviews = await safeFetch(
-          () => fetchPRReviews(octokit, owner, repo, args.username, range.since, range.until),
-          args.username
-        );
-        allPRReviews.push(...prReviews.map((i) => ({ ...i as object, _source_repo: repoFull })));
-
-        const issueComments = await safeFetch(
-          () => fetchIssueComments(octokit, owner, repo, args.username, range.since, range.until),
-          args.username
-        );
-        allIssueComments.push(...issueComments.map((i) => ({ ...i as object, _source_repo: repoFull })));
-
-        const prComments = await safeFetch(
-          () => fetchPRComments(octokit, owner, repo, args.username, range.since, range.until),
-          args.username
-        );
-        allPRComments.push(...prComments.map((i) => ({ ...i as object, _source_repo: repoFull })));
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "unknown error";
-        console.warn(`  ⚠ Skipping repo ${repoIndex} due to error: ${msg}`);
+        // Brief pause between fetch types to be nice to the API
+        await new Promise((r) => setTimeout(r, 500));
       }
     }
 
     // Write all data files for this month
-    await writeJson(monthDir, "issues-created.json", allIssuesCreated);
-    await writeJson(monthDir, "issues-assigned.json", allIssuesAssigned);
-    await writeJson(monthDir, "prs-created.json", allPRsCreated);
-    await writeJson(monthDir, "prs-assigned.json", allPRsAssigned);
-    await writeJson(monthDir, "pr-reviews.json", allPRReviews);
-    await writeJson(monthDir, "issue-comments.json", allIssueComments);
-    await writeJson(monthDir, "pr-comments.json", allPRComments);
+    for (const ft of FETCH_TYPES) {
+      await writeJson(monthDir, ft.filename, accumulated[ft.name]);
+    }
 
     console.log(`\n  📊 ${monthLabel} totals:`);
-    console.log(`     Issues created:  ${allIssuesCreated.length}`);
-    console.log(`     Issues assigned: ${allIssuesAssigned.length}`);
-    console.log(`     PRs created:     ${allPRsCreated.length}`);
-    console.log(`     PRs assigned:    ${allPRsAssigned.length}`);
-    console.log(`     PR reviews:      ${allPRReviews.length}`);
-    console.log(`     Issue comments:  ${allIssueComments.length}`);
-    console.log(`     PR comments:     ${allPRComments.length}`);
+    for (const ft of FETCH_TYPES) {
+      console.log(`     ${ft.name.padEnd(18)} ${accumulated[ft.name].length}`);
+    }
   }
 
-  console.log(`\n✅ Done!`);
+  // Final summary
+  if (totalErrors > 0) {
+    console.log(`\n⚠ Completed with ${totalErrors} failed fetch(es). Some data may be incomplete.`);
+  } else {
+    console.log(`\n✅ Done! All fetches succeeded.`);
+  }
 }
 
 main().catch((err) => {
-  // Show sanitized error — safe because sanitizeError strips all sensitive data
   const msg = err instanceof Error ? err.message : "unknown error";
   console.error(`Fatal: ${msg}`);
   process.exit(1);
