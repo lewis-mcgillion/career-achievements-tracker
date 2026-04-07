@@ -35,6 +35,20 @@ function parseArgs(): Args {
 // ---------------------------------------------------------------------------
 // Types for parsed data
 // ---------------------------------------------------------------------------
+interface DiffFileStats {
+  filename: string;
+  additions: number;
+  deletions: number;
+  status: string;
+}
+
+interface DiffStats {
+  additions: number;
+  deletions: number;
+  changed_files: number;
+  files: DiffFileStats[];
+}
+
 interface ActivityItem {
   title?: string;
   body?: string;
@@ -45,6 +59,7 @@ interface ActivityItem {
   pull_request?: { merged_at?: string };
   labels?: Array<{ name?: string }>;
   _source_repo?: string;
+  _diff_stats?: DiffStats;
 }
 
 interface ReviewItem {
@@ -122,8 +137,6 @@ const BODY_NOISE_PATTERNS = [
   /<img[^>]*\/?>/gi,
   /<details[\s\S]*?<\/details>/gi,     // collapsed sections
   /!\[[^\]]*\]\([^)]*\)/g,            // markdown images
-  /\[[^\]]*\]\(\)/g,                  // empty markdown links [text]()
-  /\[[^\]]*\]\(https?:\/\/[^)]*\)/g,  // markdown links with URLs
   /^#+\s*(what approach|which feature flag|which environment|screenshot|test plan|rollout|rollback|how to test|how did you test|deploy notes|risk|additional context|checklist|corresponding work|description of change|tracking issue|link to any feature flag|type of change|motivation|context|pre[- ]?merge|post[- ]?merge|merge requirements|deploy).*$/gim,
   /^>\s*(if you are adding|note:|warning:|important:)/gim,  // template callouts
   /^-\s*\[[ x]\]\s*.*/gim,           // checklist items
@@ -241,15 +254,89 @@ function extractDescription(body: string | undefined, maxLen = 200): string {
   return desc;
 }
 
-// Build a rich description line: title + context from body
+// Build a rich description line: title + context from body + diff stats
 function buildItemLine(item: ActivityItem): string {
   const title = sanitize(item.title ?? "untitled");
   const desc = extractDescription(item.body);
+  const diffTag = formatDiffTag(item._diff_stats);
 
-  if (!desc) return `**${title}**`;
-  // Capitalize first letter of description
-  const descCap = desc.charAt(0).toUpperCase() + desc.slice(1);
-  return `**${title}** — ${descCap}`;
+  const parts: string[] = [`**${title}**`];
+  if (desc) {
+    const descCap = desc.charAt(0).toUpperCase() + desc.slice(1);
+    parts.push(`— ${descCap}`);
+  }
+  if (diffTag) parts.push(diffTag);
+  return parts.join(" ");
+}
+
+// Format a compact diff stats tag like "(+60/-3, 3 files)"
+function formatDiffTag(stats?: DiffStats): string {
+  if (!stats || (stats.additions === 0 && stats.deletions === 0)) return "";
+  return `(+${stats.additions}/-${stats.deletions}, ${stats.changed_files} file${stats.changed_files !== 1 ? "s" : ""})`;
+}
+
+// Detect primary languages/technologies from diff file extensions
+function detectTechnologies(prs: ActivityItem[]): Map<string, number> {
+  const extMap: Record<string, string> = {
+    ".ts": "TypeScript", ".tsx": "TypeScript", ".js": "JavaScript", ".jsx": "JavaScript",
+    ".rb": "Ruby", ".go": "Go", ".py": "Python", ".rs": "Rust",
+    ".css": "CSS", ".scss": "SCSS", ".html": "HTML", ".erb": "ERB",
+    ".yml": "YAML", ".yaml": "YAML", ".json": "JSON",
+    ".sql": "SQL", ".sh": "Shell", ".bash": "Shell",
+    ".swift": "Swift", ".kt": "Kotlin", ".java": "Java",
+    ".md": "Markdown",
+  };
+
+  const techChanges = new Map<string, number>();
+  for (const pr of prs) {
+    const files = pr._diff_stats?.files ?? [];
+    for (const f of files) {
+      const ext = f.filename.match(/\.[^./]+$/)?.[0]?.toLowerCase() ?? "";
+      const tech = extMap[ext];
+      if (tech && tech !== "Markdown" && tech !== "JSON" && tech !== "YAML") {
+        techChanges.set(tech, (techChanges.get(tech) ?? 0) + f.additions + f.deletions);
+      }
+    }
+  }
+  return techChanges;
+}
+
+// Compute aggregate diff stats across all PRs
+function aggregateDiffStats(prs: ActivityItem[]): {
+  totalAdditions: number; totalDeletions: number; totalFiles: number;
+  topFiles: Array<{ filename: string; additions: number; deletions: number }>;
+} {
+  let totalAdditions = 0, totalDeletions = 0, totalFiles = 0;
+  const fileChanges = new Map<string, { additions: number; deletions: number }>();
+
+  for (const pr of prs) {
+    const stats = pr._diff_stats;
+    if (!stats) continue;
+    totalAdditions += stats.additions;
+    totalDeletions += stats.deletions;
+    totalFiles += stats.changed_files;
+    for (const f of stats.files) {
+      const existing = fileChanges.get(f.filename) ?? { additions: 0, deletions: 0 };
+      existing.additions += f.additions;
+      existing.deletions += f.deletions;
+      fileChanges.set(f.filename, existing);
+    }
+  }
+
+  const topFiles = Array.from(fileChanges.entries())
+    .sort((a, b) => (b[1].additions + b[1].deletions) - (a[1].additions + a[1].deletions))
+    .slice(0, 10)
+    .map(([filename, stats]) => ({ filename: sanitizeFilePath(filename), ...stats }));
+
+  return { totalAdditions, totalDeletions, totalFiles, topFiles };
+}
+
+// Strip org/repo/internal details from file paths, keeping only the meaningful parts
+function sanitizeFilePath(filePath: string): string {
+  // Keep only the last 2-3 path segments for readability
+  const parts = filePath.split("/");
+  if (parts.length <= 3) return parts.join("/");
+  return "…/" + parts.slice(-3).join("/");
 }
 
 // Clean a comment body for display — strip noise, URLs, images, short results
@@ -395,17 +482,42 @@ function generateMonthlyMarkdown(
         lines.push(`- **${theme.area}**: ${theme.rawCount} issues closed`);
       }
     }
+
+    // Engineering stats from diff data
+    const diffAggregate = aggregateDiffStats(allPrs);
+    if (diffAggregate.totalAdditions > 0 || diffAggregate.totalDeletions > 0) {
+      lines.push("");
+      lines.push(`**Code footprint**: +${diffAggregate.totalAdditions.toLocaleString()} / -${diffAggregate.totalDeletions.toLocaleString()} lines across ${diffAggregate.totalFiles.toLocaleString()} files`);
+
+      // Technology breakdown
+      const techs = detectTechnologies(allPrs);
+      if (techs.size > 0) {
+        const sortedTechs = Array.from(techs.entries()).sort((a, b) => b[1] - a[1]);
+        const techStr = sortedTechs.slice(0, 5).map(([lang, lines]) => `${lang} (${lines.toLocaleString()} lines)`).join(", ");
+        lines.push(`**Languages**: ${techStr}`);
+      }
+    }
   }
   lines.push("");
 
   // --- Highlights ---
   lines.push("## Highlights");
   lines.push("");
-  // Pick top PRs that have the richest body descriptions (most impact detail)
+  // Pick top PRs that have the richest body descriptions and largest diffs (most impact)
   const prsWithDesc = allPrs
-    .map((p) => ({ item: p, line: buildItemLine(p), descLen: extractDescription(p.body).length }))
+    .map((p) => ({
+      item: p,
+      line: buildItemLine(p),
+      descLen: extractDescription(p.body).length,
+      diffSize: (p._diff_stats?.additions ?? 0) + (p._diff_stats?.deletions ?? 0),
+    }))
     .filter((p) => p.descLen > 20)
-    .sort((a, b) => b.descLen - a.descLen);
+    .sort((a, b) => {
+      // Score: description richness + diff impact
+      const scoreA = a.descLen + Math.min(a.diffSize, 500);
+      const scoreB = b.descLen + Math.min(b.diffSize, 500);
+      return scoreB - scoreA;
+    });
 
   const topHighlights = dedup(
     prsWithDesc.length > 0
@@ -572,6 +684,9 @@ interface MonthSummary {
   issues: number;
   comments: number;
   areas: AreaBreakdown[];
+  additions: number;
+  deletions: number;
+  filesChanged: number;
 }
 
 function generateSummaryMarkdown(summaries: MonthSummary[]): string {
@@ -643,6 +758,15 @@ function generateSummaryMarkdown(summaries: MonthSummary[]): string {
   if (busiestMonth) {
     const bTotal = busiestMonth.prs + busiestMonth.reviews + busiestMonth.issues + busiestMonth.comments;
     lines.push(`**Busiest month:** ${monthName(busiestMonth.month)} with ${bTotal} total contributions`);
+    lines.push("");
+  }
+
+  // Aggregate code footprint
+  const totalAdditions = sorted.reduce((a, s) => a + s.additions, 0);
+  const totalDeletions = sorted.reduce((a, s) => a + s.deletions, 0);
+  const totalFilesChanged = sorted.reduce((a, s) => a + s.filesChanged, 0);
+  if (totalAdditions > 0 || totalDeletions > 0) {
+    lines.push(`**Total code footprint**: +${totalAdditions.toLocaleString()} / -${totalDeletions.toLocaleString()} lines across ${totalFilesChanged.toLocaleString()} files changed`);
     lines.push("");
   }
 
@@ -804,7 +928,7 @@ async function main(): Promise<void> {
       const areas = await loadAreasFromData(dataPath);
       const existing = await readFile(achievementFile, "utf-8");
       const nums = parseNumbersFromMarkdown(existing);
-      summaries.push({ month, ...nums, areas });
+      summaries.push({ month, ...nums, areas, additions: 0, deletions: 0, filesChanged: 0 });
       skipped++;
       continue;
     }
@@ -845,6 +969,7 @@ async function main(): Promise<void> {
 
     const allPrs = [...prsCreated, ...prsAssigned];
     const allIssues = [...issuesCreated, ...issuesAssigned];
+    const diffAgg = aggregateDiffStats(allPrs);
     summaries.push({
       month,
       prs: allPrs.length,
@@ -852,6 +977,9 @@ async function main(): Promise<void> {
       issues: allIssues.length,
       comments: issueComments.length + prComments.length,
       areas: buildAreaBreakdowns(allPrs, prReviews, allIssues, [...issueComments, ...prComments]),
+      additions: diffAgg.totalAdditions,
+      deletions: diffAgg.totalDeletions,
+      filesChanged: diffAgg.totalFiles,
     });
   }
 
@@ -865,7 +993,7 @@ async function main(): Promise<void> {
         const nums = parseNumbersFromMarkdown(content);
         const dataPath = join(args.dataDir, match[1]);
         const areas = await loadAreasFromData(dataPath);
-        summaries.push({ month: match[1], ...nums, areas });
+        summaries.push({ month: match[1], ...nums, areas, additions: 0, deletions: 0, filesChanged: 0 });
       }
     }
   } catch {
