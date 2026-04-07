@@ -307,12 +307,23 @@ function generateMonthlyMarkdown(
 // ---------------------------------------------------------------------------
 // SUMMARY.md generation
 // ---------------------------------------------------------------------------
+interface AreaBreakdown {
+  area: string;
+  prs: number;
+  reviews: number;
+  issues: number;
+  comments: number;
+  prTitles: string[];
+  issueTitles: string[];
+}
+
 interface MonthSummary {
   month: string;
   prs: number;
   reviews: number;
   issues: number;
   comments: number;
+  areas: AreaBreakdown[];
 }
 
 function generateSummaryMarkdown(summaries: MonthSummary[]): string {
@@ -322,12 +333,95 @@ function generateSummaryMarkdown(summaries: MonthSummary[]): string {
   lines.push("Auto-generated overview of monthly contributions.");
   lines.push("");
 
-  // Totals
-  const totalPrs = summaries.reduce((a, s) => a + s.prs, 0);
-  const totalReviews = summaries.reduce((a, s) => a + s.reviews, 0);
-  const totalIssues = summaries.reduce((a, s) => a + s.issues, 0);
-  const totalComments = summaries.reduce((a, s) => a + s.comments, 0);
+  const sorted = summaries.sort((a, b) => a.month.localeCompare(b.month));
+  const totalPrs = sorted.reduce((a, s) => a + s.prs, 0);
+  const totalReviews = sorted.reduce((a, s) => a + s.reviews, 0);
+  const totalIssues = sorted.reduce((a, s) => a + s.issues, 0);
+  const totalComments = sorted.reduce((a, s) => a + s.comments, 0);
+  const totalActivity = totalPrs + totalReviews + totalIssues + totalComments;
+  const firstMonth = sorted[0]?.month ?? "N/A";
+  const lastMonth = sorted[sorted.length - 1]?.month ?? "N/A";
 
+  // --- Key Achievements overview ---
+  lines.push("## Key Achievements");
+  lines.push("");
+  lines.push(`Over **${sorted.length} months** (${monthName(firstMonth)} – ${monthName(lastMonth)}), ` +
+    `contributed **${totalActivity.toLocaleString()} activities** across the platform:`);
+  lines.push("");
+
+  // Aggregate areas across all months
+  const globalAreas = new Map<string, AreaBreakdown>();
+  for (const s of sorted) {
+    for (const a of s.areas) {
+      const existing = globalAreas.get(a.area);
+      if (existing) {
+        existing.prs += a.prs;
+        existing.reviews += a.reviews;
+        existing.issues += a.issues;
+        existing.comments += a.comments;
+        existing.prTitles.push(...a.prTitles);
+        existing.issueTitles.push(...a.issueTitles);
+      } else {
+        globalAreas.set(a.area, {
+          area: a.area,
+          prs: a.prs,
+          reviews: a.reviews,
+          issues: a.issues,
+          comments: a.comments,
+          prTitles: [...a.prTitles],
+          issueTitles: [...a.issueTitles],
+        });
+      }
+    }
+  }
+
+  const rankedAreas = Array.from(globalAreas.values())
+    .map((a) => ({ ...a, total: a.prs + a.reviews + a.issues + a.comments }))
+    .sort((a, b) => b.total - a.total);
+
+  // Top areas of contribution
+  for (const area of rankedAreas) {
+    const pct = Math.round((area.total / totalActivity) * 100);
+    lines.push(`- **${area.area}** — ${area.total} contributions (${pct}%): ` +
+      `${area.prs} PRs, ${area.reviews} reviews, ${area.issues} issues, ${area.comments} comments`);
+  }
+  lines.push("");
+
+  // Busiest and most productive months
+  const byTotal = [...sorted].sort((a, b) =>
+    (b.prs + b.reviews + b.issues + b.comments) - (a.prs + a.reviews + a.issues + a.comments)
+  );
+  const busiestMonth = byTotal[0];
+  if (busiestMonth) {
+    const bTotal = busiestMonth.prs + busiestMonth.reviews + busiestMonth.issues + busiestMonth.comments;
+    lines.push(`**Busiest month:** ${monthName(busiestMonth.month)} with ${bTotal} total contributions`);
+    lines.push("");
+  }
+
+  // Highlight top shipped work per area
+  lines.push("### Top Contributions by Area");
+  lines.push("");
+  for (const area of rankedAreas.slice(0, 5)) {
+    lines.push(`#### ${area.area}`);
+    lines.push("");
+    const topPrTitles = dedup(area.prTitles).slice(0, 5);
+    const topIssueTitles = dedup(area.issueTitles).slice(0, 3);
+
+    if (topPrTitles.length > 0) {
+      lines.push("**PRs shipped:**");
+      for (const t of topPrTitles) lines.push(`- ${t}`);
+      if (area.prs > 5) lines.push(`- _...and ${area.prs - 5} more PRs_`);
+      lines.push("");
+    }
+    if (topIssueTitles.length > 0) {
+      lines.push("**Issues completed:**");
+      for (const t of topIssueTitles) lines.push(`- ${t}`);
+      if (area.issues > 3) lines.push(`- _...and ${area.issues - 3} more issues_`);
+      lines.push("");
+    }
+  }
+
+  // --- All-Time Totals ---
   lines.push("## All-Time Totals");
   lines.push("");
   lines.push("| | Count |");
@@ -338,17 +432,86 @@ function generateSummaryMarkdown(summaries: MonthSummary[]): string {
   lines.push(`| Comments | ${totalComments} |`);
   lines.push("");
 
+  // --- Area Breakdown ---
+  lines.push("## Contribution by Area");
+  lines.push("");
+  lines.push("| Area | PRs | Reviews | Issues | Comments | Total |");
+  lines.push("|---|---|---|---|---|---|");
+  for (const area of rankedAreas) {
+    lines.push(`| ${area.area} | ${area.prs} | ${area.reviews} | ${area.issues} | ${area.comments} | ${area.total} |`);
+  }
+  lines.push("");
+
+  // --- Monthly Breakdown ---
   lines.push("## Monthly Breakdown");
   lines.push("");
   lines.push("| Month | PRs | Reviews | Issues | Comments |");
   lines.push("|---|---|---|---|---|");
 
-  for (const s of summaries.sort((a, b) => b.month.localeCompare(a.month))) {
+  for (const s of [...sorted].reverse()) {
     lines.push(`| [${monthName(s.month)}](${s.month}.md) | ${s.prs} | ${s.reviews} | ${s.issues} | ${s.comments} |`);
   }
   lines.push("");
 
   return lines.join("\n");
+}
+
+// Load area breakdowns from a month's data directory
+async function loadAreasFromData(dataPath: string): Promise<AreaBreakdown[]> {
+  if (!existsSync(dataPath)) return [];
+  const [prsCreated, prsAssigned, prReviews, issuesCreated, issuesAssigned, issueComments, prComments] =
+    await Promise.all([
+      loadJson<ActivityItem>(join(dataPath, "prs-created.json")),
+      loadJson<ActivityItem>(join(dataPath, "prs-assigned.json")),
+      loadJson<ReviewItem>(join(dataPath, "pr-reviews.json")),
+      loadJson<ActivityItem>(join(dataPath, "issues-created.json")),
+      loadJson<ActivityItem>(join(dataPath, "issues-assigned.json")),
+      loadJson<CommentItem>(join(dataPath, "issue-comments.json")),
+      loadJson<CommentItem>(join(dataPath, "pr-comments.json")),
+    ]);
+  return buildAreaBreakdowns(
+    [...prsCreated, ...prsAssigned],
+    prReviews,
+    [...issuesCreated, ...issuesAssigned],
+    [...issueComments, ...prComments],
+  );
+}
+
+// Build area breakdowns from raw data for use in the overall summary
+function buildAreaBreakdowns(
+  prs: ActivityItem[],
+  reviews: ReviewItem[],
+  issues: ActivityItem[],
+  comments: CommentItem[],
+): AreaBreakdown[] {
+  const areas = new Map<string, AreaBreakdown>();
+
+  const getArea = (repo: string): AreaBreakdown => {
+    const area = repoToArea(repo);
+    if (!areas.has(area)) {
+      areas.set(area, { area, prs: 0, reviews: 0, issues: 0, comments: 0, prTitles: [], issueTitles: [] });
+    }
+    return areas.get(area)!;
+  };
+
+  for (const pr of prs) {
+    const a = getArea(pr._source_repo ?? "");
+    a.prs++;
+    if (pr.title) a.prTitles.push(sanitize(pr.title));
+  }
+  for (const r of reviews) {
+    getArea(r._source_repo ?? "").reviews++;
+  }
+  for (const iss of issues) {
+    const a = getArea(iss._source_repo ?? "");
+    a.issues++;
+    if (iss.title) a.issueTitles.push(sanitize(iss.title));
+  }
+  for (const c of comments) {
+    getArea(c._source_repo ?? "").comments++;
+  }
+
+  return Array.from(areas.values());
 }
 
 // ---------------------------------------------------------------------------
@@ -388,10 +551,12 @@ async function main(): Promise<void> {
     // Skip if already exists and not forcing
     if (!args.force && existsSync(achievementFile)) {
       console.log(`  ⏭  ${month} — already exists, skipping (use --force to regenerate)`);
-      // Still read it for the summary
+      // Load raw data to include area breakdowns in summary
+      const dataPath = join(args.dataDir, month);
+      const areas = await loadAreasFromData(dataPath);
       const existing = await readFile(achievementFile, "utf-8");
       const nums = parseNumbersFromMarkdown(existing);
-      summaries.push({ month, ...nums });
+      summaries.push({ month, ...nums, areas });
       skipped++;
       continue;
     }
@@ -438,6 +603,7 @@ async function main(): Promise<void> {
       reviews: prReviews.length,
       issues: allIssues.length,
       comments: issueComments.length + prComments.length,
+      areas: buildAreaBreakdowns(allPrs, prReviews, allIssues, [...issueComments, ...prComments]),
     });
   }
 
@@ -449,7 +615,9 @@ async function main(): Promise<void> {
       if (match && !monthDirs.includes(match[1])) {
         const content = await readFile(join(args.achievementsDir, file), "utf-8");
         const nums = parseNumbersFromMarkdown(content);
-        summaries.push({ month: match[1], ...nums });
+        const dataPath = join(args.dataDir, match[1]);
+        const areas = await loadAreasFromData(dataPath);
+        summaries.push({ month: match[1], ...nums, areas });
       }
     }
   } catch {
