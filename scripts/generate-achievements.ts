@@ -366,41 +366,84 @@ function cleanCommentBody(raw: string, maxLen = 200): string {
 }
 
 // ---------------------------------------------------------------------------
-// Theme extraction — group work into meaningful categories
+// Impact scoring — rank items by actual career-advancement value
 // ---------------------------------------------------------------------------
-interface ThemeGroup {
-  area: string;
-  items: string[];   // rich description lines (title + body context)
-  rawCount: number;   // original count before dedup
-}
 
-function extractThemes(items: ActivityItem[]): ThemeGroup[] {
-  const byArea = new Map<string, string[]>();
+// Items that are low-effort and should be ranked lower
+const LOW_IMPACT_PATTERNS = [
+  /^graduate feature flag/i,
+  /^remove feature flag/i,
+  /^remove code for feature flag/i,
+  /^revert\b/i,
+  /^bump\b/i,
+  /^update (readme|changelog|license)/i,
+  /^fix typo/i,
+  /^css (change|fix) for/i,
+  /^minor\b/i,
+];
 
-  for (const item of items) {
-    const area = repoToArea(item._source_repo ?? "");
-    if (!byArea.has(area)) byArea.set(area, []);
-    byArea.get(area)!.push(buildItemLine(item));
+function scoreItem(item: ActivityItem): number {
+  const title = item.title ?? "";
+  const diff = item._diff_stats;
+  const descLen = extractDescription(item.body).length;
+
+  // Base: description richness (0-200)
+  let score = Math.min(descLen, 200);
+
+  // Diff size bonus (capped to avoid outliers like auto-generated code)
+  if (diff) {
+    const totalLines = diff.additions + diff.deletions;
+    // Sweet spot: 50-500 lines = meaningful work. Over 1000 = diminishing returns
+    score += Math.min(totalLines, 500) * 0.3;
+    // Bonus for touching many files (indicates cross-cutting work)
+    score += Math.min(diff.changed_files, 20) * 5;
   }
 
-  return Array.from(byArea.entries())
-    .sort((a, b) => b[1].length - a[1].length)
-    .map(([area, items]) => ({ area, items, rawCount: items.length }));
+  // Penalty for low-impact patterns
+  if (LOW_IMPACT_PATTERNS.some((p) => p.test(title))) {
+    score *= 0.1;
+  }
+
+  // Bonus for high-value keywords in title
+  const highValueKeywords = [
+    "performance", "optimize", "cache", "latency", "security",
+    "pagination", "scale", "architecture", "api", "implement",
+    "redesign", "error handling", "validation", "telemetry",
+  ];
+  if (highValueKeywords.some((kw) => title.toLowerCase().includes(kw))) {
+    score *= 1.3;
+  }
+
+  return score;
 }
 
-// Deduplicate titles that are very similar (e.g., same PR in created + assigned)
-function dedup(titles: string[]): string[] {
-  const seen = new Set<string>();
-  return titles.filter((t) => {
-    const key = t.toLowerCase().replace(/[^a-z0-9]/g, "");
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+// Group items by work theme (not repo) using title/body analysis
+interface WorkTheme {
+  label: string;
+  keywords: string[];
+}
+
+const WORK_THEMES: WorkTheme[] = [
+  { label: "Security & access control", keywords: ["security", "bounty", "vulnerability", "injection", "xss", "csrf", "permission", "access control", "policy", "authz"] },
+  { label: "Performance & scalability", keywords: ["performance", "optimize", "cache", "speed", "latency", "pagination", "scale", "batch"] },
+  { label: "Accessibility", keywords: ["accessibility", "a11y", "keyboard", "screen reader", "aria", "focus", "wcag"] },
+  { label: "Observability & debugging", keywords: ["debug", "log", "monitor", "trace", "observ", "metric", "telemetry"] },
+  { label: "New features", keywords: ["implement", "add", "create", "new", "introduce", "ship", "launch", "enable"] },
+  { label: "Bug fixes & reliability", keywords: ["fix", "bug", "broken", "regression", "resolve", "error handling", "retry", "resilience"] },
+  { label: "UX improvements", keywords: ["ux", "usability", "truncat", "overflow", "responsive", "viewport", "layout", "styling", "modal", "dialog", "tooltip", "placeholder"] },
+  { label: "Code quality & maintenance", keywords: ["refactor", "cleanup", "deprecat", "migrate", "tech debt"] },
+];
+
+function detectItemTheme(item: ActivityItem): string {
+  const title = (item.title ?? "").toLowerCase();
+  for (const theme of WORK_THEMES) {
+    if (theme.keywords.some((kw) => title.includes(kw))) return theme.label;
+  }
+  return "General engineering";
 }
 
 // ---------------------------------------------------------------------------
-// Markdown generation
+// Markdown generation — Monthly
 // ---------------------------------------------------------------------------
 function monthName(ym: string): string {
   const [y, m] = ym.split("-");
@@ -422,254 +465,149 @@ function generateMonthlyMarkdown(
   prComments: CommentItem[],
 ): string {
   const lines: string[] = [];
-  const allPrs = [...prsCreated, ...prsAssigned];
-  const allIssues = [...issuesCreated, ...issuesAssigned];
+  const allPrs = dedup_items([...prsCreated, ...prsAssigned]);
+  const allIssues = dedup_items([...issuesCreated, ...issuesAssigned]);
   const totalComments = issueComments.length + prComments.length;
 
   lines.push(`# ${monthName(month)}`);
   lines.push("");
 
-  // --- Impact ---
-  lines.push("## Impact");
+  // --- Score and rank all PRs ---
+  const scoredPrs = allPrs
+    .map((p) => ({ item: p, score: scoreItem(p), line: buildItemLine(p) }))
+    .sort((a, b) => b.score - a.score);
+
+  // Filter out low-impact items for the highlights
+  const impactfulPrs = scoredPrs.filter((p) => p.score > 30);
+
+  // --- Overview stats ---
+  const diffAgg = aggregateDiffStats(allPrs);
+  const techs = detectTechnologies(allPrs);
+  const areas = new Set(allPrs.map((p) => repoToArea(p._source_repo ?? "")));
+
+  const statParts: string[] = [];
+  statParts.push(`**${allPrs.length} PRs merged**`);
+  if (prReviews.length > 0) statParts.push(`**${prReviews.length} reviews**`);
+  if (allIssues.length > 0) statParts.push(`**${allIssues.length} issues closed**`);
+  if (totalComments > 0) statParts.push(`**${totalComments} discussions**`);
+
+  lines.push(statParts.join(" · "));
+  if (diffAgg.totalAdditions > 0 || diffAgg.totalDeletions > 0) {
+    const techStr = techs.size > 0
+      ? ` in ${Array.from(techs.entries()).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([lang]) => lang).join(", ")}`
+      : "";
+    lines.push(`+${diffAgg.totalAdditions.toLocaleString()} / -${diffAgg.totalDeletions.toLocaleString()} lines across ${diffAgg.totalFiles} files${techStr}`);
+  }
+  if (areas.size > 1) {
+    lines.push(`Spanning ${areas.size} areas: ${Array.from(areas).join(", ")}`);
+  }
   lines.push("");
 
-  const prThemes = extractThemes(allPrs);
-  const issueThemes = extractThemes(allIssues);
+  // --- Key Achievements ---
+  lines.push("## Key Achievements");
+  lines.push("");
 
-  if (prThemes.length === 0 && issueThemes.length === 0) {
-    lines.push("_No merged PRs or completed issues this month._");
+  if (impactfulPrs.length === 0 && allIssues.length === 0) {
+    lines.push("_No notable achievements this month._");
   } else {
-    // Detect work themes from titles to build narrative
-    const allTitles = [...allPrs, ...allIssues].map((i) => (i.title ?? "").toLowerCase());
-    const themeKeywords: Array<{ label: string; keywords: string[]; found: string[] }> = [
-      { label: "Security", keywords: ["security", "bounty", "vulnerability", "injection", "xss", "csrf", "auth", "permission", "access control"], found: [] },
-      { label: "Performance & reliability", keywords: ["performance", "optimize", "cache", "speed", "latency", "reliability", "retry", "error handling", "resilience"], found: [] },
-      { label: "Accessibility", keywords: ["accessibility", "a11y", "keyboard", "screen reader", "aria", "focus", "wcag"], found: [] },
-      { label: "UX improvements", keywords: ["ux", "usability", "truncat", "overflow", "responsive", "viewport", "layout", "styling", "modal", "dialog", "button"], found: [] },
-      { label: "Feature development", keywords: ["implement", "add", "create", "new", "introduce", "ship", "launch", "enable"], found: [] },
-      { label: "Bug fixes", keywords: ["fix", "bug", "broken", "regression", "resolve", "patch"], found: [] },
-      { label: "Code quality", keywords: ["refactor", "cleanup", "remove feature flag", "graduate", "deprecat", "migrate", "tech debt"], found: [] },
-      { label: "Debugging & observability", keywords: ["debug", "log", "monitor", "trace", "observ", "metric"], found: [] },
-    ];
-
-    for (const title of allTitles) {
-      for (const theme of themeKeywords) {
-        if (theme.keywords.some((kw) => title.includes(kw))) {
-          theme.found.push(title);
-        }
-      }
+    // Group impactful PRs by theme
+    const themeGroups = new Map<string, typeof impactfulPrs>();
+    for (const pr of impactfulPrs) {
+      const theme = detectItemTheme(pr.item);
+      if (!themeGroups.has(theme)) themeGroups.set(theme, []);
+      themeGroups.get(theme)!.push(pr);
     }
 
-    const activeThemes = themeKeywords.filter((t) => t.found.length > 0).sort((a, b) => b.found.length - a.found.length);
+    // Sort themes by total score
+    const rankedThemes = Array.from(themeGroups.entries())
+      .map(([theme, prs]) => ({ theme, prs, totalScore: prs.reduce((a, p) => a + p.score, 0) }))
+      .sort((a, b) => b.totalScore - a.totalScore);
 
-    if (activeThemes.length > 0) {
-      for (const theme of activeThemes.slice(0, 5)) {
-        lines.push(`- **${theme.label}**: ${theme.found.length} item${theme.found.length !== 1 ? "s" : ""} across ${
-          new Set([...allPrs, ...allIssues]
-            .filter((i) => theme.keywords.some((kw) => (i.title ?? "").toLowerCase().includes(kw)))
-            .map((i) => repoToArea(i._source_repo ?? ""))
-          ).size
-        } area(s)`);
-      }
-    }
-
-    lines.push("");
-
-    // Area summary with counts
-    for (const theme of prThemes) {
-      const issueTheme = issueThemes.find((t) => t.area === theme.area);
-      const issueCount = issueTheme?.rawCount ?? 0;
-      const reviewCount = prReviews.filter((r) => repoToArea(r._source_repo ?? "") === theme.area).length;
-      const parts: string[] = [`${theme.rawCount} PRs shipped`];
-      if (reviewCount > 0) parts.push(`${reviewCount} reviews`);
-      if (issueCount > 0) parts.push(`${issueCount} issues closed`);
-      lines.push(`- **${theme.area}**: ${parts.join(", ")}`);
-    }
-    for (const theme of issueThemes) {
-      if (!prThemes.find((t) => t.area === theme.area)) {
-        lines.push(`- **${theme.area}**: ${theme.rawCount} issues closed`);
-      }
-    }
-
-    // Engineering stats from diff data
-    const diffAggregate = aggregateDiffStats(allPrs);
-    if (diffAggregate.totalAdditions > 0 || diffAggregate.totalDeletions > 0) {
+    for (const { theme, prs } of rankedThemes.slice(0, 6)) {
+      lines.push(`**${theme}**`);
       lines.push("");
-      lines.push(`**Code footprint**: +${diffAggregate.totalAdditions.toLocaleString()} / -${diffAggregate.totalDeletions.toLocaleString()} lines across ${diffAggregate.totalFiles.toLocaleString()} files`);
+      for (const pr of prs.slice(0, 4)) {
+        lines.push(`- ${pr.line}`);
+      }
+      if (prs.length > 4) {
+        lines.push(`- _...and ${prs.length - 4} more_`);
+      }
+      lines.push("");
+    }
 
-      // Technology breakdown
-      const techs = detectTechnologies(allPrs);
-      if (techs.size > 0) {
-        const sortedTechs = Array.from(techs.entries()).sort((a, b) => b[1] - a[1]);
-        const techStr = sortedTechs.slice(0, 5).map(([lang, lines]) => `${lang} (${lines.toLocaleString()} lines)`).join(", ");
-        lines.push(`**Languages**: ${techStr}`);
+    // Show impactful issues (non-flag-graduation ones)
+    const impactfulIssues = allIssues
+      .filter((i) => !LOW_IMPACT_PATTERNS.some((p) => p.test(i.title ?? "")))
+      .map((i) => ({ item: i, score: scoreItem(i), line: buildItemLine(i) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+
+    if (impactfulIssues.length > 0) {
+      const hasThemeContent = rankedThemes.length > 0;
+      if (hasThemeContent) lines.push("");
+      lines.push("**Issues driven to completion**");
+      lines.push("");
+      for (const issue of impactfulIssues) {
+        lines.push(`- ${issue.line}`);
       }
     }
   }
   lines.push("");
 
-  // --- Highlights ---
-  lines.push("## Highlights");
-  lines.push("");
-  // Pick top PRs that have the richest body descriptions and largest diffs (most impact)
-  const prsWithDesc = allPrs
-    .map((p) => ({
-      item: p,
-      line: buildItemLine(p),
-      descLen: extractDescription(p.body).length,
-      diffSize: (p._diff_stats?.additions ?? 0) + (p._diff_stats?.deletions ?? 0),
-    }))
-    .filter((p) => p.descLen > 20)
-    .sort((a, b) => {
-      // Score: description richness + diff impact
-      const scoreA = a.descLen + Math.min(a.diffSize, 500);
-      const scoreB = b.descLen + Math.min(b.diffSize, 500);
-      return scoreB - scoreA;
-    });
-
-  const topHighlights = dedup(
-    prsWithDesc.length > 0
-      ? prsWithDesc.map((p) => p.line)
-      : allPrs.map((p) => buildItemLine(p))
-  ).slice(0, 5);
-
-  if (topHighlights.length > 0) {
-    for (const line of topHighlights) {
-      lines.push(`- ${line}`);
-    }
-  } else {
-    lines.push("_No notable highlights this month._");
-  }
-  lines.push("");
-
-  // --- PRs & Code ---
-  lines.push("## PRs & Code");
-  lines.push("");
-  if (allPrs.length === 0) {
-    lines.push("_No merged PRs this month._");
-  } else {
-    for (const theme of prThemes) {
-      lines.push(`### ${theme.area}`);
-      lines.push("");
-      const items = dedup(theme.items).slice(0, 8);
-      for (const line of items) {
-        lines.push(`- ${line}`);
-      }
-      if (theme.rawCount > 8) {
-        lines.push(`- _...and ${theme.rawCount - 8} more_`);
-      }
-      lines.push("");
-    }
-  }
-
-  // --- Reviews & Technical Leadership ---
-  lines.push("## Code Reviews & Technical Leadership");
-  lines.push("");
-  if (prReviews.length === 0) {
-    lines.push("_No PR reviews this month._");
-  } else {
-    // Count unique PRs reviewed and review types
+  // --- Technical Leadership (reviews, only if substantive) ---
+  if (prReviews.length > 0) {
     const uniquePRs = new Set(prReviews.map((r) => `${r._source_repo}:${r.pull_number}`));
-    const approvals = prReviews.filter((r) => r.state === "APPROVED").length;
-    const changesRequested = prReviews.filter((r) => r.state === "CHANGES_REQUESTED").length;
-    const commented = prReviews.filter((r) => r.state === "COMMENTED").length;
 
-    lines.push(`Reviewed **${uniquePRs.size} PRs** across ${new Set(prReviews.map((r) => repoToArea(r._source_repo ?? ""))).size} area(s):`);
-    lines.push("");
-    const reviewParts: string[] = [];
-    if (approvals > 0) reviewParts.push(`${approvals} approval${approvals !== 1 ? "s" : ""}`);
-    if (changesRequested > 0) reviewParts.push(`${changesRequested} change request${changesRequested !== 1 ? "s" : ""}`);
-    if (commented > 0) reviewParts.push(`${commented} review comment${commented !== 1 ? "s" : ""}`);
-    lines.push(`- ${reviewParts.join(", ")}`);
-
-    // Group by area
-    const reviewByArea = new Map<string, { count: number; prs: Set<string> }>();
-    for (const r of prReviews) {
-      const area = repoToArea(r._source_repo ?? "");
-      if (!reviewByArea.has(area)) reviewByArea.set(area, { count: 0, prs: new Set() });
-      const entry = reviewByArea.get(area)!;
-      entry.count++;
-      entry.prs.add(`${r._source_repo}:${r.pull_number}`);
-    }
-    for (const [area, data] of Array.from(reviewByArea.entries()).sort((a, b) => b[1].prs.size - a[1].prs.size)) {
-      lines.push(`- **${area}**: reviewed ${data.prs.size} PR${data.prs.size !== 1 ? "s" : ""}`);
-    }
-
-    // Highlight substantive review comments
+    // Only include this section if there's meaningful review activity
     const substantiveComments = prComments
       .map((c) => cleanCommentBody(c.body ?? "", 200))
-      .filter((b) => b.length > 50 && !b.match(/^\s*\W+\s*$/)); // skip emoji-only
+      .filter((b) => b.length > 50 && !b.match(/^\s*\W+\s*$/));
 
-    if (substantiveComments.length > 0) {
+    if (uniquePRs.size >= 3 || substantiveComments.length > 0) {
+      lines.push("## Technical Leadership");
       lines.push("");
-      lines.push("**Notable review feedback given:**");
-      lines.push("");
-      for (const comment of substantiveComments.slice(0, 4)) {
-        lines.push(`> ${comment}`);
+      lines.push(`Reviewed ${uniquePRs.size} PRs across ${new Set(prReviews.map((r) => repoToArea(r._source_repo ?? ""))).size} areas`);
+
+      if (substantiveComments.length > 0) {
         lines.push("");
-      }
-    }
-  }
-  lines.push("");
-
-  // --- Issues ---
-  lines.push("## Issues");
-  lines.push("");
-  if (allIssues.length === 0) {
-    lines.push("_No completed issues this month._");
-  } else {
-    for (const theme of issueThemes) {
-      lines.push(`### ${theme.area}`);
-      lines.push("");
-      const items = dedup(theme.items).slice(0, 8);
-      for (const line of items) {
-        lines.push(`- ${line}`);
-      }
-      if (theme.rawCount > 8) {
-        lines.push(`- _...and ${theme.rawCount - 8} more_`);
+        for (const comment of substantiveComments.slice(0, 3)) {
+          lines.push(`> ${comment}`);
+          lines.push("");
+        }
       }
       lines.push("");
     }
   }
 
-  // --- Cross-team Engagement ---
-  const allComments = [...issueComments, ...prComments];
-  const commentAreas = new Set(allComments.map((c) => repoToArea(c._source_repo ?? "")));
-  const cleanedIssueComments = issueComments
-    .map((c) => cleanCommentBody(c.body ?? "", 220))
-    .filter((b) => b.length > 60 && !b.match(/^\s*\W+\s*$/));
-
-  if (cleanedIssueComments.length > 0 || commentAreas.size > 1) {
-    lines.push("## Cross-team Engagement");
-    lines.push("");
-
-    if (commentAreas.size > 1) {
-      lines.push(`Active across **${commentAreas.size} areas**: ${Array.from(commentAreas).join(", ")}`);
-      lines.push("");
-    }
-
-    if (cleanedIssueComments.length > 0) {
-      lines.push("**Key discussion contributions:**");
-      lines.push("");
-      for (const discussion of cleanedIssueComments.slice(0, 3)) {
-        lines.push(`> ${discussion}`);
-        lines.push("");
-      }
-    }
-  }
-
-  // --- Numbers ---
-  lines.push("## Numbers");
+  // --- Compact numbers table ---
+  lines.push("---");
   lines.push("");
-  lines.push("| | Count |");
-  lines.push("|---|---|");
-  lines.push(`| PRs merged | ${allPrs.length} |`);
-  lines.push(`| PRs reviewed | ${prReviews.length} |`);
-  lines.push(`| Issues completed | ${allIssues.length} |`);
-  lines.push(`| Comments | ${totalComments} |`);
+  lines.push(`${allPrs.length} PRs · ${prReviews.length} reviews · ${allIssues.length} issues · ${totalComments} comments`);
   lines.push("");
 
   return lines.join("\n");
+}
+
+// Deduplicate items by title
+function dedup_items(items: ActivityItem[]): ActivityItem[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = (item.title ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// Deduplicate string titles
+function dedup(titles: string[]): string[] {
+  const seen = new Set<string>();
+  return titles.filter((t) => {
+    const key = t.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -695,13 +633,12 @@ interface MonthSummary {
   additions: number;
   deletions: number;
   filesChanged: number;
+  topPrs: Array<{ title: string; line: string; score: number }>;
 }
 
 function generateSummaryMarkdown(summaries: MonthSummary[]): string {
   const lines: string[] = [];
   lines.push("# Career Achievements Summary");
-  lines.push("");
-  lines.push("Auto-generated overview of monthly contributions.");
   lines.push("");
 
   const sorted = summaries.sort((a, b) => a.month.localeCompare(b.month));
@@ -709,127 +646,54 @@ function generateSummaryMarkdown(summaries: MonthSummary[]): string {
   const totalReviews = sorted.reduce((a, s) => a + s.reviews, 0);
   const totalIssues = sorted.reduce((a, s) => a + s.issues, 0);
   const totalComments = sorted.reduce((a, s) => a + s.comments, 0);
-  const totalActivity = totalPrs + totalReviews + totalIssues + totalComments;
-  const firstMonth = sorted[0]?.month ?? "N/A";
-  const lastMonth = sorted[sorted.length - 1]?.month ?? "N/A";
-
-  // --- Key Achievements overview ---
-  lines.push("## Key Achievements");
-  lines.push("");
-  lines.push(`Over **${sorted.length} months** (${monthName(firstMonth)} – ${monthName(lastMonth)}), ` +
-    `contributed **${totalActivity.toLocaleString()} activities** across the platform:`);
-  lines.push("");
-
-  // Aggregate areas across all months
-  const globalAreas = new Map<string, AreaBreakdown>();
-  for (const s of sorted) {
-    for (const a of s.areas) {
-      const existing = globalAreas.get(a.area);
-      if (existing) {
-        existing.prs += a.prs;
-        existing.reviews += a.reviews;
-        existing.issues += a.issues;
-        existing.comments += a.comments;
-        existing.prTitles.push(...a.prTitles);
-        existing.issueTitles.push(...a.issueTitles);
-      } else {
-        globalAreas.set(a.area, {
-          area: a.area,
-          prs: a.prs,
-          reviews: a.reviews,
-          issues: a.issues,
-          comments: a.comments,
-          prTitles: [...a.prTitles],
-          issueTitles: [...a.issueTitles],
-        });
-      }
-    }
-  }
-
-  const rankedAreas = Array.from(globalAreas.values())
-    .map((a) => ({ ...a, total: a.prs + a.reviews + a.issues + a.comments }))
-    .sort((a, b) => b.total - a.total);
-
-  // Top areas of contribution
-  for (const area of rankedAreas) {
-    const pct = Math.round((area.total / totalActivity) * 100);
-    lines.push(`- **${area.area}** — ${area.total} contributions (${pct}%): ` +
-      `${area.prs} PRs, ${area.reviews} reviews, ${area.issues} issues, ${area.comments} comments`);
-  }
-  lines.push("");
-
-  // Busiest and most productive months
-  const byTotal = [...sorted].sort((a, b) =>
-    (b.prs + b.reviews + b.issues + b.comments) - (a.prs + a.reviews + a.issues + a.comments)
-  );
-  const busiestMonth = byTotal[0];
-  if (busiestMonth) {
-    const bTotal = busiestMonth.prs + busiestMonth.reviews + busiestMonth.issues + busiestMonth.comments;
-    lines.push(`**Busiest month:** ${monthName(busiestMonth.month)} with ${bTotal} total contributions`);
-    lines.push("");
-  }
-
-  // Aggregate code footprint
   const totalAdditions = sorted.reduce((a, s) => a + s.additions, 0);
   const totalDeletions = sorted.reduce((a, s) => a + s.deletions, 0);
   const totalFilesChanged = sorted.reduce((a, s) => a + s.filesChanged, 0);
-  if (totalAdditions > 0 || totalDeletions > 0) {
-    lines.push(`**Total code footprint**: +${totalAdditions.toLocaleString()} / -${totalDeletions.toLocaleString()} lines across ${totalFilesChanged.toLocaleString()} files changed`);
-    lines.push("");
-  }
+  const firstMonth = sorted[0]?.month ?? "N/A";
+  const lastMonth = sorted[sorted.length - 1]?.month ?? "N/A";
 
-  // Highlight top shipped work per area
-  lines.push("### Top Contributions by Area");
+  // --- Overview ---
+  lines.push(`Over **${sorted.length} months** (${monthName(firstMonth)} – ${monthName(lastMonth)}):`);
   lines.push("");
-  for (const area of rankedAreas.slice(0, 5)) {
-    lines.push(`#### ${area.area}`);
-    lines.push("");
-    const topPrTitles = dedup(area.prTitles).slice(0, 5);
-    const topIssueTitles = dedup(area.issueTitles).slice(0, 3);
-
-    if (topPrTitles.length > 0) {
-      lines.push("**PRs shipped:**");
-      for (const t of topPrTitles) lines.push(`- ${t}`);
-      if (area.prs > 5) lines.push(`- _...and ${area.prs - 5} more PRs_`);
-      lines.push("");
-    }
-    if (topIssueTitles.length > 0) {
-      lines.push("**Issues completed:**");
-      for (const t of topIssueTitles) lines.push(`- ${t}`);
-      if (area.issues > 3) lines.push(`- _...and ${area.issues - 3} more issues_`);
-      lines.push("");
-    }
-  }
-
-  // --- All-Time Totals ---
-  lines.push("## All-Time Totals");
-  lines.push("");
-  lines.push("| | Count |");
-  lines.push("|---|---|");
-  lines.push(`| PRs merged | ${totalPrs} |`);
-  lines.push(`| PRs reviewed | ${totalReviews} |`);
-  lines.push(`| Issues completed | ${totalIssues} |`);
-  lines.push(`| Comments | ${totalComments} |`);
-  lines.push("");
-
-  // --- Area Breakdown ---
-  lines.push("## Contribution by Area");
-  lines.push("");
-  lines.push("| Area | PRs | Reviews | Issues | Comments | Total |");
-  lines.push("|---|---|---|---|---|---|");
-  for (const area of rankedAreas) {
-    lines.push(`| ${area.area} | ${area.prs} | ${area.reviews} | ${area.issues} | ${area.comments} | ${area.total} |`);
+  lines.push(`- **${totalPrs} PRs merged** · ${totalReviews} code reviews · ${totalIssues} issues completed`);
+  if (totalAdditions > 0) {
+    lines.push(`- **+${totalAdditions.toLocaleString()} / -${totalDeletions.toLocaleString()} lines** across ${totalFilesChanged.toLocaleString()} files`);
   }
   lines.push("");
 
-  // --- Monthly Breakdown ---
-  lines.push("## Monthly Breakdown");
+  // --- Top Achievements (all-time, ranked by impact score) ---
+  lines.push("## Highest-Impact Contributions");
   lines.push("");
-  lines.push("| Month | PRs | Reviews | Issues | Comments |");
+
+  const allTopPrs = sorted
+    .flatMap((s) => s.topPrs.map((pr) => ({ ...pr, month: s.month })))
+    .sort((a, b) => b.score - a.score);
+
+  // Deduplicate by title key
+  const seenKeys = new Set<string>();
+  const uniqueTopPrs = allTopPrs.filter((pr) => {
+    const key = pr.title.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (seenKeys.has(key)) return false;
+    seenKeys.add(key);
+    return true;
+  });
+
+  for (const pr of uniqueTopPrs.slice(0, 15)) {
+    lines.push(`- ${pr.line} _(${monthName(pr.month)})_`);
+  }
+  lines.push("");
+
+  // --- Monthly timeline ---
+  lines.push("## Monthly Timeline");
+  lines.push("");
+  lines.push("| Month | PRs | Reviews | Issues | Lines Changed |");
   lines.push("|---|---|---|---|---|");
 
   for (const s of [...sorted].reverse()) {
-    lines.push(`| [${monthName(s.month)}](${s.month}.md) | ${s.prs} | ${s.reviews} | ${s.issues} | ${s.comments} |`);
+    const linesChanged = s.additions + s.deletions > 0
+      ? `+${s.additions.toLocaleString()}/-${s.deletions.toLocaleString()}`
+      : "—";
+    lines.push(`| [${monthName(s.month)}](${s.month}.md) | ${s.prs} | ${s.reviews} | ${s.issues} | ${linesChanged} |`);
   }
   lines.push("");
 
@@ -936,7 +800,7 @@ async function main(): Promise<void> {
       const areas = await loadAreasFromData(dataPath);
       const existing = await readFile(achievementFile, "utf-8");
       const nums = parseNumbersFromMarkdown(existing);
-      summaries.push({ month, ...nums, areas, additions: 0, deletions: 0, filesChanged: 0 });
+      summaries.push({ month, ...nums, areas, additions: 0, deletions: 0, filesChanged: 0, topPrs: [] });
       skipped++;
       continue;
     }
@@ -975,9 +839,13 @@ async function main(): Promise<void> {
     console.log(`  ✅ ${month} — generated`);
     generated++;
 
-    const allPrs = [...prsCreated, ...prsAssigned];
-    const allIssues = [...issuesCreated, ...issuesAssigned];
+    const allPrs = dedup_items([...prsCreated, ...prsAssigned]);
+    const allIssues = dedup_items([...issuesCreated, ...issuesAssigned]);
     const diffAgg = aggregateDiffStats(allPrs);
+    const topPrs = allPrs
+      .map((p) => ({ title: p.title ?? "", line: buildItemLine(p), score: scoreItem(p) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10);
     summaries.push({
       month,
       prs: allPrs.length,
@@ -988,6 +856,7 @@ async function main(): Promise<void> {
       additions: diffAgg.totalAdditions,
       deletions: diffAgg.totalDeletions,
       filesChanged: diffAgg.totalFiles,
+      topPrs,
     });
   }
 
@@ -1001,7 +870,7 @@ async function main(): Promise<void> {
         const nums = parseNumbersFromMarkdown(content);
         const dataPath = join(args.dataDir, match[1]);
         const areas = await loadAreasFromData(dataPath);
-        summaries.push({ month: match[1], ...nums, areas, additions: 0, deletions: 0, filesChanged: 0 });
+        summaries.push({ month: match[1], ...nums, areas, additions: 0, deletions: 0, filesChanged: 0, topPrs: [] });
       }
     }
   } catch {
@@ -1018,6 +887,17 @@ async function main(): Promise<void> {
 
 // Parse numbers from an existing achievement markdown file
 function parseNumbersFromMarkdown(content: string): { prs: number; reviews: number; issues: number; comments: number } {
+  // New compact format: "N PRs · N reviews · N issues · N comments"
+  const compactMatch = content.match(/(\d+)\s*PRs?\s*·\s*(\d+)\s*reviews?\s*·\s*(\d+)\s*issues?\s*·\s*(\d+)\s*comments?/);
+  if (compactMatch) {
+    return {
+      prs: parseInt(compactMatch[1], 10),
+      reviews: parseInt(compactMatch[2], 10),
+      issues: parseInt(compactMatch[3], 10),
+      comments: parseInt(compactMatch[4], 10),
+    };
+  }
+  // Fallback: old table format
   const getNum = (label: string): number => {
     const match = content.match(new RegExp(`\\|\\s*${label}\\s*\\|\\s*(\\d+)\\s*\\|`));
     return match ? parseInt(match[1], 10) : 0;
