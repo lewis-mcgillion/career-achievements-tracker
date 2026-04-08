@@ -800,7 +800,22 @@ async function main(): Promise<void> {
       const areas = await loadAreasFromData(dataPath);
       const existing = await readFile(achievementFile, "utf-8");
       const nums = parseNumbersFromMarkdown(existing);
-      summaries.push({ month, ...nums, areas, additions: 0, deletions: 0, filesChanged: 0, topPrs: [] });
+      // Load PR data for diff stats and top PRs even for skipped months
+      const [prsC, prsA] = await Promise.all([
+        loadJson<ActivityItem>(join(dataPath, "prs-created.json")),
+        loadJson<ActivityItem>(join(dataPath, "prs-assigned.json")),
+      ]);
+      const skipPrs = dedup_items([...prsC, ...prsA]);
+      const skipDiff = aggregateDiffStats(skipPrs);
+      const skipTopPrs = skipPrs
+        .map((p) => ({ title: p.title ?? "", line: buildItemLine(p), score: scoreItem(p) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 10);
+      summaries.push({
+        month, ...nums, areas,
+        additions: skipDiff.totalAdditions, deletions: skipDiff.totalDeletions,
+        filesChanged: skipDiff.totalFiles, topPrs: skipTopPrs,
+      });
       skipped++;
       continue;
     }
@@ -870,7 +885,21 @@ async function main(): Promise<void> {
         const nums = parseNumbersFromMarkdown(content);
         const dataPath = join(args.dataDir, match[1]);
         const areas = await loadAreasFromData(dataPath);
-        summaries.push({ month: match[1], ...nums, areas, additions: 0, deletions: 0, filesChanged: 0, topPrs: [] });
+        const [prsC2, prsA2] = await Promise.all([
+          loadJson<ActivityItem>(join(dataPath, "prs-created.json")),
+          loadJson<ActivityItem>(join(dataPath, "prs-assigned.json")),
+        ]);
+        const existPrs = dedup_items([...prsC2, ...prsA2]);
+        const existDiff = aggregateDiffStats(existPrs);
+        const existTopPrs = existPrs
+          .map((p) => ({ title: p.title ?? "", line: buildItemLine(p), score: scoreItem(p) }))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 10);
+        summaries.push({
+          month: match[1], ...nums, areas,
+          additions: existDiff.totalAdditions, deletions: existDiff.totalDeletions,
+          filesChanged: existDiff.totalFiles, topPrs: existTopPrs,
+        });
       }
     }
   } catch {
