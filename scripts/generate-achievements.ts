@@ -164,12 +164,15 @@ const BODY_NOISE_PATTERNS = [
   /otherwise\s+\w+\s+will not be able to capture.*$/gim,
   /a feature flag to CAPI.*$/gim,
   /configured within the list of services.*$/gim,
+  /Sampling metrics at a rate less than.*$/gim,
+  /Reducing cardinality of metric tags.*$/gim,
+  /- Non-production$/gim,
 ];
 
 // Internal identifiers to redact
 const REDACT_PATTERNS = [
   /\b[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+\b/g, // org/repo
-  /\b(copilot[_-]\w+)\b/gi,                 // feature flag names (keep if generic)
+  /\bcopilot[_-](?:[a-zA-Z0-9]+[_-])*[a-zA-Z0-9]+\b/gi, // feature flag names (copilot_foo_bar, copilot-chat-x-y)
   /\b(devportal|githubapp|dotcom)\b/gi,
 ];
 
@@ -217,6 +220,12 @@ function extractDescription(body: string | undefined, maxLen = 200): string {
   // Take first 1-2 meaningful lines as the description
   let desc = lines.slice(0, 2).join(" ").trim();
 
+  // Convert markdown links to text FIRST so redaction can see clean identifiers
+  desc = desc
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // markdown links → text only
+    .replace(/\[([^\]]*)\]\(\)/g, "$1")       // empty links → text only
+    .replace(/https?:\/\/[^\s)>]+/gi, "");    // strip remaining URLs
+
   // Clean up internal references
   for (const pat of REDACT_PATTERNS) {
     desc = desc.replace(pat, "");
@@ -227,8 +236,6 @@ function extractDescription(body: string | undefined, maxLen = 200): string {
     .replace(/<[^>]+>/g, "")           // any remaining HTML tags
     .replace(/\*\*[^*]*\*\*/g, "")     // bold markers with content (risk labels etc)
     .replace(/\*\*/g, "")              // orphan bold markers
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // remaining markdown links → text only
-    .replace(/\[([^\]]*)\]\(\)/g, "$1") // empty links
     .replace(/`([^`]+)`/g, "$1")        // inline code → plain text
     .replace(/\s*-\s*-\s*/g, ". ")      // double dash separators → period
     .replace(/\.\s*\./g, ".")           // double periods
@@ -245,6 +252,7 @@ function extractDescription(body: string | undefined, maxLen = 200): string {
     .replace(/\ba feature flag to \w+,?\s*the owning service be\b.*/gi, "")
     .replace(/\bconfigured within the list of services\b.*/gi, "")
     .replace(/\s*,\s*$/, "") // trailing comma
+    .replace(/\s+(based on|depending on|according to|related to|closes|fixes|resolves)\s*$/gi, "") // dangling prepositions
     .replace(/\s{2,}/g, " ")
     .trim();
 
