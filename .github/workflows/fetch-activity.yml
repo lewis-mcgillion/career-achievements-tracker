@@ -19,6 +19,11 @@ on:
         required: false
         type: boolean
         default: false
+      force_fetch:
+        description: "Re-fetch activity data even if month directories already exist (use when a previous fetch captured only part of a month)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -90,31 +95,100 @@ jobs:
 
       - name: Determine months to fetch
         id: skip
+        env:
+          INPUT_FORCE_FETCH: ${{ inputs.force_fetch }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          # Check which months already have data in career-data
+          # Decide whether to override the per-month skip logic.
+          # On the scheduled cron run we ALWAYS re-fetch the target month(s):
+          # the previous fetch may have captured only a partial month (e.g. a
+          # mid-month backfill), and re-fetching is idempotent.
+          if [ "$INPUT_FORCE_FETCH" = "true" ] || [ "$EVENT_NAME" = "schedule" ]; then
+            FORCE_FETCH="true"
+          else
+            FORCE_FETCH="false"
+          fi
+          echo "force_fetch_effective=$FORCE_FETCH" >> "$GITHUB_OUTPUT"
+
+          # Check which months need fetching.
           IFS=',' read -ra ALL_MONTHS <<< "${{ steps.dates.outputs.months }}"
           NEED_FETCH=""
           ALREADY_HAVE=""
-          for M in "${ALL_MONTHS[@]}"; do
-            if [ -d "/tmp/career-data/data/$M" ] && [ -f "/tmp/career-data/data/$M/prs-created.json" ]; then
-              [ -n "$ALREADY_HAVE" ] && ALREADY_HAVE="$ALREADY_HAVE,"
-              ALREADY_HAVE="$ALREADY_HAVE$M"
-            else
-              [ -n "$NEED_FETCH" ] && NEED_FETCH="$NEED_FETCH,"
-              NEED_FETCH="$NEED_FETCH$M"
-            fi
-          done
+
+          if [ "$FORCE_FETCH" = "true" ]; then
+            NEED_FETCH="${{ steps.dates.outputs.months }}"
+            echo "🔁 force_fetch active (event=$EVENT_NAME) — re-fetching every month in range"
+          else
+            for M in "${ALL_MONTHS[@]}"; do
+              # A month counts as "already have" only if we have a non-empty
+              # data file AND the latest event in it lands within 3 days of
+              # month-end (proxy for "fetch ran after the month closed").
+              SKIP_OK="false"
+              if [ -f "/tmp/career-data/data/$M/prs-created.json" ]; then
+                MONTH_END=$(date -d "${M}-01 + 1 month - 1 day" '+%Y-%m-%d' 2>/dev/null || \
+                  date -j -v+1m -v-1d -f '%Y-%m-%d' "${M}-01" '+%Y-%m-%d')
+                MONTH_END_TS=$(date -d "$MONTH_END" '+%s' 2>/dev/null || \
+                  date -j -f '%Y-%m-%d' "$MONTH_END" '+%s')
+                THRESHOLD_TS=$((MONTH_END_TS - 3 * 86400))
+
+                # Max event timestamp across PR/review/issue fetches for the month.
+                LATEST_ISO=$(jq -r '
+                  [
+                    .[]? | (
+                      .updated_at? // .merged_at? // .closed_at? //
+                      .submitted_at? // .created_at? // empty
+                    )
+                  ] | map(select(. != null and . != "")) | max // empty
+                ' /tmp/career-data/data/$M/prs-created.json \
+                    /tmp/career-data/data/$M/pr-reviews.json \
+                    /tmp/career-data/data/$M/issues-created.json \
+                    /tmp/career-data/data/$M/pr-comments.json \
+                    /tmp/career-data/data/$M/issue-comments.json 2>/dev/null \
+                  | sort | tail -1)
+
+                # If the data was captured well after month-end, we trust it
+                # (even if the month had zero activity — empty arrays are fine
+                # as long as the fetch ran past the threshold).
+                if [ -n "$LATEST_ISO" ]; then
+                  LATEST_TS=$(date -d "$LATEST_ISO" '+%s' 2>/dev/null || \
+                    date -j -f '%Y-%m-%dT%H:%M:%SZ' "$LATEST_ISO" '+%s' 2>/dev/null || echo 0)
+                  if [ "$LATEST_TS" -ge "$THRESHOLD_TS" ]; then
+                    SKIP_OK="true"
+                  fi
+                fi
+                # Also accept months where the data dir was written more than
+                # 14 days after month-end (e.g. a manual backfill of an older
+                # quiet month) — empty arrays are legitimate "no activity".
+                if [ "$SKIP_OK" = "false" ]; then
+                  FILE_MTIME=$(stat -c '%Y' "/tmp/career-data/data/$M/prs-created.json" 2>/dev/null || \
+                    stat -f '%m' "/tmp/career-data/data/$M/prs-created.json" 2>/dev/null || echo 0)
+                  GRACE_TS=$((MONTH_END_TS + 14 * 86400))
+                  if [ "$FILE_MTIME" -ge "$GRACE_TS" ]; then
+                    SKIP_OK="true"
+                  fi
+                fi
+              fi
+
+              if [ "$SKIP_OK" = "true" ]; then
+                [ -n "$ALREADY_HAVE" ] && ALREADY_HAVE="$ALREADY_HAVE,"
+                ALREADY_HAVE="$ALREADY_HAVE$M"
+              else
+                [ -n "$NEED_FETCH" ] && NEED_FETCH="$NEED_FETCH,"
+                NEED_FETCH="$NEED_FETCH$M"
+              fi
+            done
+          fi
 
           echo "need_fetch=$NEED_FETCH" >> "$GITHUB_OUTPUT"
           echo "already_have=$ALREADY_HAVE" >> "$GITHUB_OUTPUT"
 
           if [ -n "$ALREADY_HAVE" ]; then
-            echo "⏭  Already have data for: $ALREADY_HAVE"
+            echo "⏭  Already have complete data for: $ALREADY_HAVE"
           fi
           if [ -n "$NEED_FETCH" ]; then
             echo "📥 Need to fetch: $NEED_FETCH"
           else
-            echo "✅ All requested months already have data — skipping fetch"
+            echo "✅ All requested months already have complete data — skipping fetch"
           fi
 
       - name: Fetch activity data
