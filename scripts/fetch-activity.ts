@@ -83,11 +83,19 @@ function setRedactTargets(repos: string[], username: string): void {
 }
 
 function sanitizeError(err: unknown): string {
-  const e = err as { status?: number; message?: string };
-  if (e.status) return `HTTP ${e.status}`;
+  const e = err as {
+    status?: number;
+    message?: string;
+    response?: { data?: { message?: string; errors?: unknown } };
+  };
   let msg = String(e.message ?? "unknown error");
+  if (e.status) {
+    const body = e.response?.data;
+    const bodyMsg = body?.message ?? "";
+    const bodyErr = body?.errors ? JSON.stringify(body.errors) : "";
+    msg = [`HTTP ${e.status}`, bodyMsg, bodyErr].filter(Boolean).join(" — ");
+  }
   msg = msg.replace(/https?:\/\/[^\s]+/g, "[redacted-url]");
-  msg = msg.replace(/[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+/g, "[redacted]");
   msg = msg.replace(/"owner":\s*"[^"]+"/g, '"owner":"[redacted]"');
   msg = msg.replace(/"repo":\s*"[^"]+"/g, '"repo":"[redacted]"');
   msg = msg.replace(/"repository":\s*"[^"]+"/g, '"repository":"[redacted]"');
