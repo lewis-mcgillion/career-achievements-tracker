@@ -170,7 +170,8 @@ async function searchItems(
   while (true) {
     const resp = await octokit.rest.search.issuesAndPullRequests({
       q: query, per_page: 100, page, sort: "created", order: "asc",
-    });
+      advanced_search: "true",
+    } as Parameters<typeof octokit.rest.search.issuesAndPullRequests>[0]);
     items.push(...resp.data.items);
     console.log(`        ${label} page ${page}: ${resp.data.items.length} items (${items.length}/${resp.data.total_count} total)`);
     if (items.length >= resp.data.total_count || resp.data.items.length === 0) break;
