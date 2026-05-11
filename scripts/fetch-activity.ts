@@ -107,17 +107,18 @@ function sanitizeError(err: unknown): string {
 // ---------------------------------------------------------------------------
 
 async function safeFetch<T>(label: string, fn: () => Promise<T>): Promise<T> {
-  const maxRetries = 4;
+  const maxRetries = 6;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (err: unknown) {
-      const e = err as { status?: number; response?: { headers?: Record<string, string> } };
+      const e = err as { status?: number; message?: string; response?: { headers?: Record<string, string> } };
       const status = e.status ?? 0;
+      const msg = e.message ?? "";
 
       // Retry on server errors (5xx)
       if (status >= 500 && attempt < maxRetries) {
-        const waitMs = attempt * 15_000; // 15s, 30s, 45s
+        const waitMs = attempt * 15_000; // 15s, 30s, 45s, 60s, 75s
         console.warn(`      ⚠ ${label}: HTTP ${status}, retry ${attempt}/${maxRetries} in ${waitMs / 1000}s...`);
         await new Promise((r) => setTimeout(r, waitMs));
         continue;
@@ -138,6 +139,15 @@ async function safeFetch<T>(label: string, fn: () => Promise<T>): Promise<T> {
       if (retryAfter && attempt < maxRetries) {
         const waitMs = parseInt(retryAfter, 10) * 1000 || 30_000;
         console.warn(`      ⏳ ${label}: retry-after ${waitMs / 1000}s...`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+
+      // octokit throttling plugin emits "Request quota exhausted" without a
+      // useful status code; wait for the search rate window to reset.
+      if (msg.includes("Request quota exhausted") && attempt < maxRetries) {
+        const waitMs = 65_000;
+        console.warn(`      ⏳ ${label}: quota exhausted, waiting ${waitMs / 1000}s for reset...`);
         await new Promise((r) => setTimeout(r, waitMs));
         continue;
       }
@@ -401,6 +411,7 @@ async function main(): Promise<void> {
   console.log(`Repos: ${args.repos.length} repo(s)\n`);
 
   let totalErrors = 0;
+  const monthErrors: Record<string, number> = {};
 
   for (const range of ranges) {
     const monthLabel = `${range.year}-${range.month}`;
@@ -410,9 +421,9 @@ async function main(): Promise<void> {
 
     const monthDir = join(args.outputDir, monthLabel);
 
-    // Per-type accumulators
     const accumulated: Record<string, unknown[]> = {};
     for (const ft of FETCH_TYPES) accumulated[ft.name] = [];
+    monthErrors[monthLabel] = 0;
 
     for (const repoFull of args.repos) {
       const [owner, repo] = repoFull.split("/");
@@ -430,29 +441,35 @@ async function main(): Promise<void> {
           console.log(`    ✓ ${ft.name}: ${items.length} items`);
         } catch (err) {
           totalErrors++;
+          monthErrors[monthLabel]++;
           const msg = err instanceof Error ? err.message : "unknown error";
           console.warn(`    ✗ ${ft.name}: FAILED — ${msg}`);
         }
 
-        // Brief pause between fetch types to be nice to the API
         await new Promise((r) => setTimeout(r, 500));
       }
     }
 
-    // Write all data files for this month
-    for (const ft of FETCH_TYPES) {
-      await writeJson(monthDir, ft.filename, accumulated[ft.name]);
-    }
-
-    console.log(`\n  📊 ${monthLabel} totals:`);
-    for (const ft of FETCH_TYPES) {
-      console.log(`     ${ft.name.padEnd(18)} ${accumulated[ft.name].length}`);
+    // Only persist this month's data if every fetch succeeded. Partial data
+    // would otherwise corrupt the historical record and block future re-fetches.
+    if (monthErrors[monthLabel] === 0) {
+      for (const ft of FETCH_TYPES) {
+        await writeJson(monthDir, ft.filename, accumulated[ft.name]);
+      }
+      console.log(`\n  📊 ${monthLabel} totals:`);
+      for (const ft of FETCH_TYPES) {
+        console.log(`     ${ft.name.padEnd(18)} ${accumulated[ft.name].length}`);
+      }
+    } else {
+      console.warn(`\n  ⚠ ${monthLabel}: ${monthErrors[monthLabel]} fetch(es) failed — NOT writing month data.`);
     }
   }
 
   // Final summary
   if (totalErrors > 0) {
-    console.log(`\n⚠ Completed with ${totalErrors} failed fetch(es). Some data may be incomplete.`);
+    console.error(`\n✗ FAILED: ${totalErrors} fetch(es) did not succeed — refusing to write incomplete data.`);
+    console.error(`  Re-run the workflow (or this script) to retry; the throttling plugin will pace requests.`);
+    process.exit(2);
   } else {
     console.log(`\n✅ Done! All fetches succeeded.`);
   }
