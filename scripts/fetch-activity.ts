@@ -396,6 +396,81 @@ const FETCH_TYPES: Array<{ name: string; filename: string; fn: FetchFn }> = [
 ];
 
 // ---------------------------------------------------------------------------
+// Preflight — verify the token can SEARCH the tracked repos before the run.
+//
+// The monthly fetch depends on the search API over private org repos. If the
+// PAT loses SSO/SAML authorization for the org, every search returns HTTP 422
+// ("the listed users and repositories cannot be searched ... you do not have
+// permission") — but only deep inside the per-month loop, after cloning
+// career-data, producing a cryptic, hard-to-diagnose failure. This check
+// surfaces that exact failure up front with the one-time fix.
+// ---------------------------------------------------------------------------
+
+function isAccessError(err: unknown): boolean {
+  const e = err as { status?: number; message?: string; response?: { data?: { message?: string } } };
+  const status = e.status;
+  const text = `${e.message ?? ""} ${e.response?.data?.message ?? ""}`.toLowerCase();
+
+  // Explicit SSO/SAML or permission denials — the failure mode this guards against.
+  if (
+    text.includes("cannot be searched") ||
+    text.includes("do not have permission") ||
+    text.includes("saml") ||
+    text.includes("sso") ||
+    text.includes("protected by organization")
+  ) {
+    return true;
+  }
+  // 422 on search over org repos is the canonical "not authorized to search" signal.
+  if (status === 422) return true;
+  // A 403 that is NOT a rate-limit is an authorization problem.
+  if (status === 403 && !text.includes("rate limit") && !text.includes("quota") && !text.includes("secondary")) {
+    return true;
+  }
+  return false;
+}
+
+async function preflightSearchAccess(octokit: Octokit, repos: string[]): Promise<void> {
+  console.log(`\n🔍 Preflight: verifying search access for ${repos.length} tracked repo(s)...`);
+  let blocked = 0;
+  for (let i = 0; i < repos.length; i++) {
+    // Log by index only — never print private repo/org names into public logs.
+    const label = `repo ${i + 1}/${repos.length}`;
+    try {
+      await octokit.rest.search.issuesAndPullRequests({
+        q: `repo:${repos[i]} is:pr`, per_page: 1, advanced_search: "true",
+      } as Parameters<typeof octokit.rest.search.issuesAndPullRequests>[0]);
+      console.log(`  ✓ ${label}`);
+    } catch (err) {
+      if (isAccessError(err)) {
+        blocked++;
+        console.error(`  ✗ ${label}: search access denied`);
+      } else {
+        // Transient (network/5xx) — let the main run's retry logic handle it.
+        console.warn(`  ⚠ ${label}: ${sanitizeError(err)} (will retry in main run)`);
+      }
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+
+  if (blocked > 0) {
+    console.error(`\n${"=".repeat(64)}`);
+    console.error(`✗ PREFLIGHT FAILED: the token cannot search ${blocked}/${repos.length} tracked repo(s).`);
+    console.error(`This almost always means CAREER_DATA_PAT has lost SSO/SAML`);
+    console.error(`authorization for the tracked organisation(s).`);
+    console.error(`\nFix (only the repo owner can do this):`);
+    console.error(`  1. Create/refresh a classic PAT with the "repo" scope.`);
+    console.error(`  2. On the token page: "Configure SSO" → AUTHORIZE it for the org.`);
+    console.error(`  3. gh secret set CAREER_DATA_PAT --repo <owner>/career-achievements-tracker`);
+    console.error(`  4. gh workflow run "Fetch GitHub Activity" \\`);
+    console.error(`       --repo <owner>/career-achievements-tracker -f force_fetch=true`);
+    console.error(`${"=".repeat(64)}`);
+    process.exit(3);
+  }
+  console.log(`✓ Preflight passed — search access OK for all tracked repos.\n`);
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -414,6 +489,9 @@ async function main(): Promise<void> {
 
   const { data: rateLimit } = await octokit.rest.rateLimit.get();
   console.log(`✓ Rate limit: ${rateLimit.resources.core.remaining}/${rateLimit.resources.core.limit} core, ${rateLimit.resources.search.remaining}/${rateLimit.resources.search.limit} search`);
+
+  // Fail fast (with a clear fix) if the token can't search the tracked repos.
+  await preflightSearchAccess(octokit, args.repos);
 
   const ranges = monthRanges(args.startDate, args.endDate);
   console.log(`\nFetching data for ${ranges.length} month(s): ${ranges.map((r) => `${r.year}-${r.month}`).join(", ")}`);
